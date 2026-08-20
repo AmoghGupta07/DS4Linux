@@ -137,8 +137,66 @@ me know what you see if so.
   move. That's deliberate: isolate one thing at a time.
 - No real controller involved yet — that's Milestone 3.
 
+## Milestone 3: real passthrough (real DS4 -> virtual DS4, 1:1)
+
+Wires Milestone 1's real-pad parsing directly into Milestone 2's virtual
+pad, with no remapping — move the real stick, the virtual stick moves;
+press a real button, the virtual button fires. This is the first
+milestone that behaves like a (minimal) working replica.
+
+The parsing/calibration logic was pulled out of the Milestone 1 tool into
+`src/ds4_input.rs` so it's shared, not duplicated — `src/main.rs` (the
+M1 tool) now just calls into that module and behaves identically to
+before.
+
+### Setup
+
+Same udev rules as Milestones 1 and 2 (hidraw + uinput access) — nothing
+new to install.
+
+### Run
+
+```
+cargo build --release
+./target/release/passthrough_test
+```
+
+With the real DS4 v2 plugged in over USB. It'll connect, read
+calibration (unused this milestone, but loaded the same way as M1), spin
+up the virtual pad, then stream real input straight through.
+
+### Verify
+
+1. `evtest` on the virtual "Sony Interactive Entertainment Wireless
+   Controller" — move sticks, press buttons on the *real* pad, watch the
+   *virtual* device's events in evtest.
+2. `jstest /dev/input/jsN` for a visual check.
+3. The real test: open **Steam Big Picture** or any DS4-aware game and
+   confirm it's picked up as a DualShock 4 and responds correctly to
+   input. This is the actual goal of the whole project, so it's worth
+   doing even though it's informal compared to `evtest`.
+
+### What to expect
+
+Every button/stick/trigger on the real pad should mirror 1:1 on the
+virtual one, including the d-pad's 8-way directions. If a specific button
+fires the wrong virtual button (e.g. pressing Circle shows up as East vs
+some other position in evtest), tell me which real button produced which
+wrong virtual event and I'll check the bit mapping for that one.
+
+### Known simplifications in this milestone
+
+- Real pad only — no fallback/reconnect handling if you unplug and
+  replug mid-run; the program will just start erroring on reads. Milestone
+  3.x can add hotplug detection via the `udev` crate once this core loop
+  is confirmed solid.
+- Gyro is read (for calibration) but not used yet — right stick is driven
+  purely by the real right stick, no gyro blend. That's the next milestone.
+- Touchpad finger data isn't read or forwarded yet.
+- LED/rumble aren't wired up yet.
+
 ## Next milestone
 
-Milestone 3: wire real DS4 input (Milestone 1) directly into the virtual
-DS4 output (Milestone 2), 1:1, no remapping yet. Test in an actual game
-or Steam Big Picture.
+Milestone 3.5: gyro-to-right-stick blending (additive, clamped to the
+stick's circular range), with always-on / toggle / hold modes selectable
+per profile — building directly on this passthrough loop.

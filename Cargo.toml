@@ -18,3 +18,7 @@ path = "src/main.rs"
 [[bin]]
 name = "virtual_ds4_test"
 path = "src/bin/virtual_ds4_test.rs"
+
+[[bin]]
+name = "passthrough_test"
+path = "src/bin/passthrough_test.rs"
