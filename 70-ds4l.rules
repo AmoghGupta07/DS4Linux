@@ -1,0 +1,19 @@
+# Grants your user (via the 'input' group, or plugdev on some distros)
+# read/write access to the DS4 v2's hidraw device without needing root.
+#
+# Install:
+#   sudo cp 70-ds4l.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Then make sure your user is in the right group, e.g.:
+#   sudo usermod -aG input $USER
+# (log out/in for group change to take effect)
+
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="09cc", MODE="0660", GROUP="input"
+# DS4 v1, in case you test against one later:
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="05c4", MODE="0660", GROUP="input"
+
+# Milestone 2: access to /dev/uinput for creating the virtual DS4.
+# Some distros already grant this to the 'input' group by default; this
+# rule makes it explicit so it works regardless of distro defaults.
+KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"

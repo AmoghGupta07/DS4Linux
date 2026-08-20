@@ -1,0 +1,20 @@
+[package]
+name = "ds4l"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hidapi = "2.6"
+libc = "0.2"
+
+[lib]
+name = "ds4l"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ds4l"
+path = "src/main.rs"
+
+[[bin]]
+name = "virtual_ds4_test"
+path = "src/bin/virtual_ds4_test.rs"
