@@ -31,7 +31,7 @@ fn main() {
             }
             Ok(len) if len >= 25 && buf[0] == 0x01 => {
                 let state = parse_report(&buf);
-                let (gx, gy, gz) = calibrated_gyro_deg_s(&state, &cal);
+                let gyro = calibrated_gyro_deg_s(&state, &cal);
 
                 print!(
                     "\rLX:{:3} LY:{:3} RX:{:3} RY:{:3} | dpad:{} \
@@ -50,9 +50,9 @@ fn main() {
                     state.r1 as u8,
                     state.l2_analog,
                     state.r2_analog,
-                    gx,
-                    gy,
-                    gz,
+                    gyro.pitch,
+                    gyro.yaw,
+                    gyro.roll,
                 );
                 use std::io::Write;
                 std::io::stdout().flush().ok();

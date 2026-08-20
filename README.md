@@ -195,8 +195,86 @@ wrong virtual event and I'll check the bit mapping for that one.
 - Touchpad finger data isn't read or forwarded yet.
 - LED/rumble aren't wired up yet.
 
+## Milestone 3.5: gyro-to-right-stick blending
+
+Right stick = real right stick + gyro contribution, additively blended
+and clamped to the stick's circular range (not per-axis, so diagonal aim
+can't exceed the stick's max speed). Left stick, buttons, dpad, triggers
+all pass through unchanged from Milestone 3.
+
+Gyro math lives in `src/gyro_stick.rs`, independent of any profile system
+that doesn't exist yet -- `GyroStickConfig` is deliberately shaped like
+what a future profile loader will deserialize into, so this isn't
+throwaway code.
+
+Gate button for Toggle/Hold modes is **L2**, treated as "pressed" above
+roughly 50% analog depression.
+
+### Run
+
+```
+cargo build --release
+./target/release/gyro_stick_test
+```
+
+Default mode is **Hold** (hold L2 to activate gyro aiming). To try the
+other modes, edit the `MODE` const near the top of
+`src/bin/gyro_stick_test.rs`:
+```rust
+const MODE: GyroMode = GyroMode::Hold;      // hold L2 to activate
+const MODE: GyroMode = GyroMode::Toggle;    // press L2 to flip on/off
+const MODE: GyroMode = GyroMode::AlwaysOn;  // gyro always active
+```
+and rebuild. This one-line edit is the stand-in for what will become a
+per-profile setting.
+
+### Verify
+
+1. In `evtest` on the virtual pad, watch `ABS_RX`/`ABS_RY` while rotating
+   the real controller (with L2 held, if using Hold mode) -- values should
+   shift smoothly in the direction of rotation, on top of whatever the
+   real right stick is doing.
+2. In a game: hold L2, turn the controller left/right (yaw) and tilt it
+   up/down (pitch), confirm the camera/aim follows.
+
+### Tuning the feel
+
+Everything you'd want to adjust lives in `GyroStickConfig` in
+`src/gyro_stick.rs`:
+
+- **`deg_per_sec_at_full_stick`** (default 120.0): lower = more sensitive
+  (less rotation needed to reach max stick deflection), higher = less
+  sensitive. This is the main "sensitivity slider."
+- **`smoothing_alpha`** (default 0.35): lower = smoother but slightly
+  laggier, higher = snappier but more prone to sensor jitter.
+- **`deadzone_deg_s`** (default 2.0): raise if you notice slow stick creep
+  while holding the pad still; this is separate from calibration bias and
+  catches leftover noise.
+
+### If gyro axes feel inverted or swapped
+
+The sign/axis convention comment in `compute_gyro_stick_delta` explains
+the intended mapping (yaw right -> stick right, pitch up -> stick "up" per
+DS4's Y-axis convention). Axis feel can vary slightly by controller unit
+orientation -- if pitch and yaw feel swapped, or a direction feels
+backwards, tell me exactly what you did (e.g. "turning the pad right
+moves the stick down") and I'll help you flip the correct sign rather
+than guessing.
+
+### Known simplifications in this milestone
+
+- Roll axis is read/calibrated but unused -- DS4Windows-style gyro aiming
+  typically only uses pitch+yaw for a 2D stick, which is what's implemented
+  here.
+- Gate threshold (50% L2 press) is a hardcoded constant, not yet
+  configurable -- trivial to expose once profiles exist.
+- No per-axis sensitivity (e.g. different X vs Y sensitivity) yet, just
+  one shared `deg_per_sec_at_full_stick` for both.
+
 ## Next milestone
 
-Milestone 3.5: gyro-to-right-stick blending (additive, clamped to the
-stick's circular range), with always-on / toggle / hold modes selectable
-per profile — building directly on this passthrough loop.
+Touchpad handling: real touchpad passed through as native DS4 touchpad
+data (evdev multitouch) OR repurposed as mouse/remap, selectable per
+profile -- as you scoped earlier. This is a new evdev capability (multitouch
+axes) that Milestone 2's uinput device doesn't have yet, so it starts with
+extending the virtual pad's device descriptor.

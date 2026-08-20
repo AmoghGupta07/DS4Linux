@@ -138,17 +138,23 @@ pub fn read_calibration(device: &HidDevice) -> Result<GyroCalibration, String> {
     let accel_z_plus = read_i16_le(&buf, 31) as i32;
     let accel_z_minus = read_i16_le(&buf, 33) as i32;
 
-    // Known reference angular rate used by Sony's calibration procedure,
-    // matches the constant used by hid-sony / DS4Windows.
-    const GYRO_SPEED_SCALE_DEG_S: f64 = 2000.0; // full range +/-2000 deg/s at extremes
+    // Real formula, matching Linux's hid-sony.c / hid-playstation.c exactly:
+    //   sens_numer = (gyro_speed_plus + gyro_speed_minus) * DS4_GYRO_RES_PER_DEG_S
+    //   sens_denom = axis_plus - axis_minus   (per-axis range)
+    //   scale = sens_numer / sens_denom
+    // DS4_GYRO_RES_PER_DEG_S is the kernel's fixed-point resolution constant
+    // (raw gyro ticks per calibrated degree/s at the *reference* speed).
+    // My earlier version used a hardcoded 2000.0 deg/s numerator instead of
+    // the controller's own gyro_speed_plus/minus reference -- that's what
+    // caused RX to saturate to 1/255: the scale was wrong by whatever
+    // factor separates 2000 from this unit's actual sens_numer.
+    const DS4_GYRO_RES_PER_DEG_S: f64 = 1024.0; // matches kernel's DS4_GYRO_RES_PER_DEG_S
 
-    let pitch_scale = GYRO_SPEED_SCALE_DEG_S / ((pitch_plus - pitch_minus) as f64).max(1.0);
-    let yaw_scale = GYRO_SPEED_SCALE_DEG_S / ((yaw_plus - yaw_minus) as f64).max(1.0);
-    let roll_scale = GYRO_SPEED_SCALE_DEG_S / ((roll_plus - roll_minus) as f64).max(1.0);
-    // gyro_speed_plus/minus currently unused directly but kept in the report
-    // parse for future cross-check/logging since some units report slightly
-    // different plus/minus symmetry.
-    let _ = (gyro_speed_plus, gyro_speed_minus);
+    let sens_numer = (gyro_speed_plus + gyro_speed_minus) as f64 * DS4_GYRO_RES_PER_DEG_S;
+
+    let pitch_scale = sens_numer / ((pitch_plus - pitch_minus) as f64).abs().max(1.0);
+    let yaw_scale = sens_numer / ((yaw_plus - yaw_minus) as f64).abs().max(1.0);
+    let roll_scale = sens_numer / ((roll_plus - roll_minus) as f64).abs().max(1.0);
 
     const ACCEL_RANGE_G: f64 = 2.0; // +/-2g nominal range between plus/minus refs
 
@@ -215,12 +221,23 @@ pub fn parse_report(buf: &[u8]) -> PadState {
     s
 }
 
+/// Calibrated gyro angular velocity in degrees/second, one field per axis
+/// so call sites can't silently transpose pitch/yaw/roll the way an
+/// unlabeled tuple return would allow.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GyroDegPerSec {
+    pub pitch: f64,
+    pub yaw: f64,
+    pub roll: f64,
+}
+
 /// Converts raw gyro ticks to degrees/second using calibration.
-pub fn calibrated_gyro_deg_s(state: &PadState, cal: &GyroCalibration) -> (f64, f64, f64) {
-    let x = (state.gyro_x as i32 - cal.pitch_bias) as f64 * cal.pitch_scale;
-    let y = (state.gyro_y as i32 - cal.yaw_bias) as f64 * cal.yaw_scale;
-    let z = (state.gyro_z as i32 - cal.roll_bias) as f64 * cal.roll_scale;
-    (x, y, z)
+pub fn calibrated_gyro_deg_s(state: &PadState, cal: &GyroCalibration) -> GyroDegPerSec {
+    GyroDegPerSec {
+        pitch: (state.gyro_x as i32 - cal.pitch_bias) as f64 * cal.pitch_scale,
+        yaw: (state.gyro_y as i32 - cal.yaw_bias) as f64 * cal.yaw_scale,
+        roll: (state.gyro_z as i32 - cal.roll_bias) as f64 * cal.roll_scale,
+    }
 }
 
 /// Opens the DS4 v2 over USB via hidapi and reads its calibration,
