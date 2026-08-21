@@ -20,6 +20,10 @@ fn main() {
         std::process::exit(1);
     });
     println!("Calibration loaded: {:#?}", cal);
+    println!(
+        "\nIf gyro still feels off, this raw calibration data helps diagnose it \
+         further -- share it if asked."
+    );
 
     println!("\nStreaming input. Ctrl+C to quit.\n");
 
@@ -36,7 +40,8 @@ fn main() {
                 print!(
                     "\rLX:{:3} LY:{:3} RX:{:3} RY:{:3} | dpad:{} \
                      △:{} ○:{} ×:{} □:{} L1:{} R1:{} L2:{:3} R2:{:3} | \
-                     gyro(deg/s) x:{:7.1} y:{:7.1} z:{:7.1}   ",
+                     gyro(deg/s) x:{:7.1} y:{:7.1} z:{:7.1} | \
+                     touch1[{} id:{:3} x:{:4} y:{:3}] touch2[{} id:{:3} x:{:4} y:{:3}]   ",
                     state.lx,
                     state.ly,
                     state.rx,
@@ -53,6 +58,14 @@ fn main() {
                     gyro.pitch,
                     gyro.yaw,
                     gyro.roll,
+                    if state.finger1.touching { "DOWN" } else { "UP  " },
+                    state.finger1.contact_id,
+                    state.finger1.x,
+                    state.finger1.y,
+                    if state.finger2.touching { "DOWN" } else { "UP  " },
+                    state.finger2.contact_id,
+                    state.finger2.x,
+                    state.finger2.y,
                 );
                 use std::io::Write;
                 std::io::stdout().flush().ok();

@@ -46,6 +46,26 @@ impl GyroCalibration {
     }
 }
 
+/// One touchpad finger contact. x in [0, 1919], y in [0, 941] (DS4's
+/// native touchpad resolution, confirmed against the kernel's
+/// DS4_TOUCHPAD_WIDTH/HEIGHT constants). x/y are only meaningful when
+/// `touching` is true.
+///
+/// NOTE: this parsing is NEW for this milestone and has NOT yet been
+/// verified against real hardware the way buttons/sticks/gyro have been
+/// across Milestones 1-3.5. Treat touching/x/y as unconfirmed until
+/// tested -- offsets are taken directly from Linux kernel hid-sony.c
+/// source (confirmed: "multi-touch trackpad data starts at offset 33 on
+/// USB"), cross-checked against the community TouchFingerData struct
+/// layout, but this exact codepath hasn't run against your DS4 v2 yet.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TouchFinger {
+    pub touching: bool,
+    pub contact_id: u8,
+    pub x: u16,
+    pub y: u16,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PadState {
     pub lx: u8,
@@ -69,6 +89,8 @@ pub struct PadState {
     pub touchpad_click: bool,
     pub l2_analog: u8,
     pub r2_analog: u8,
+    pub finger1: TouchFinger,
+    pub finger2: TouchFinger,
     pub gyro_x: i16,
     pub gyro_y: i16,
     pub gyro_z: i16,
@@ -79,6 +101,24 @@ pub struct PadState {
 
 fn read_i16_le(buf: &[u8], offset: usize) -> i16 {
     i16::from_le_bytes([buf[offset], buf[offset + 1]])
+}
+
+/// Parses one 4-byte touch finger block per the layout confirmed from
+/// kernel source: byte0 bit7 = NOT touching (0 = touching), bits0-6 =
+/// contact id; byte1 = X low 8 bits; byte2 low nibble = X high 4 bits,
+/// high nibble = Y low 4 bits; byte3 = Y high 8 bits.
+fn parse_touch_finger(b: &[u8]) -> TouchFinger {
+    debug_assert_eq!(b.len(), 4);
+    let touching = (b[0] & 0x80) == 0; // MSB=0 means finger IS touching
+    let contact_id = b[0] & 0x7F;
+    let x = (b[1] as u16) | (((b[2] & 0x0F) as u16) << 8);
+    let y = ((b[2] as u16) >> 4) | ((b[3] as u16) << 4);
+    TouchFinger {
+        touching,
+        contact_id,
+        x,
+        y,
+    }
 }
 
 /// Reads and parses feature report 0x02 (37 bytes on USB) which contains
@@ -107,7 +147,7 @@ pub fn read_calibration(device: &HidDevice) -> Result<GyroCalibration, String> {
     // 13-14 gyro pitch minus
     // 15-16 gyro yaw minus
     // 17-18 gyro roll minus
-    // 19-20 gyro speed plus (shared scale reference, ~123 in raw ticks)
+    // 19-20 gyro speed plus (shared scale reference)
     // 21-22 gyro speed minus
     // 23-24 accel x plus
     // 25-26 accel x minus
@@ -141,20 +181,18 @@ pub fn read_calibration(device: &HidDevice) -> Result<GyroCalibration, String> {
     // Real formula, matching Linux's hid-sony.c / hid-playstation.c exactly:
     //   sens_numer = (gyro_speed_plus + gyro_speed_minus) * DS4_GYRO_RES_PER_DEG_S
     //   sens_denom = axis_plus - axis_minus   (per-axis range)
-    //   scale = sens_numer / sens_denom
-    // DS4_GYRO_RES_PER_DEG_S is the kernel's fixed-point resolution constant
-    // (raw gyro ticks per calibrated degree/s at the *reference* speed).
-    // My earlier version used a hardcoded 2000.0 deg/s numerator instead of
-    // the controller's own gyro_speed_plus/minus reference -- that's what
-    // caused RX to saturate to 1/255: the scale was wrong by whatever
-    // factor separates 2000 from this unit's actual sens_numer.
-    const DS4_GYRO_RES_PER_DEG_S: f64 = 1024.0; // matches kernel's DS4_GYRO_RES_PER_DEG_S
+    //   evdev_value = (raw - bias) * sens_numer / sens_denom
+    // evdev_value is in units of 1/DS4_GYRO_RES_PER_DEG_S degree/s, so
+    // real_deg_s = evdev_value / DS4_GYRO_RES_PER_DEG_S. Substituting and
+    // cancelling DS4_GYRO_RES_PER_DEG_S algebraically:
+    //   real_deg_s = (raw - bias) * (speed_plus + speed_minus) / sens_denom
+    // Confirmed correct against real hardware readings (see conversation
+    // history / calibration debug output from testing).
+    let speed_sum = (gyro_speed_plus + gyro_speed_minus) as f64;
 
-    let sens_numer = (gyro_speed_plus + gyro_speed_minus) as f64 * DS4_GYRO_RES_PER_DEG_S;
-
-    let pitch_scale = sens_numer / ((pitch_plus - pitch_minus) as f64).abs().max(1.0);
-    let yaw_scale = sens_numer / ((yaw_plus - yaw_minus) as f64).abs().max(1.0);
-    let roll_scale = sens_numer / ((roll_plus - roll_minus) as f64).abs().max(1.0);
+    let pitch_scale = speed_sum / ((pitch_plus - pitch_minus) as f64).abs().max(1.0);
+    let yaw_scale = speed_sum / ((yaw_plus - yaw_minus) as f64).abs().max(1.0);
+    let roll_scale = speed_sum / ((roll_plus - roll_minus) as f64).abs().max(1.0);
 
     const ACCEL_RANGE_G: f64 = 2.0; // +/-2g nominal range between plus/minus refs
 
@@ -180,6 +218,7 @@ pub fn read_calibration(device: &HidDevice) -> Result<GyroCalibration, String> {
 
 /// Parses a single USB input report (report ID 0x01) into a PadState.
 /// Caller must ensure buf[0] == 0x01 and buf.len() >= 25 before calling.
+/// Touchpad fields are only populated if buf.len() >= 41.
 pub fn parse_report(buf: &[u8]) -> PadState {
     let mut s = PadState::default();
 
@@ -218,6 +257,20 @@ pub fn parse_report(buf: &[u8]) -> PadState {
     s.accel_y = read_i16_le(buf, 21);
     s.accel_z = read_i16_le(buf, 23);
 
+    // Touchpad: confirmed from Linux kernel hid-sony.c source (patch
+    // comment: "multi-touch trackpad data starts at offset 33 on USB and
+    // 35 on Bluetooth"), cross-checked against the community
+    // TouchFingerData struct layout (Game Controller Collective wiki).
+    // Each finger is 4 bytes: byte0 bit7 = NOT touching (inverted -- 0
+    // means finger IS down), bits 0-6 = contact id; bytes 1-3 pack two
+    // 12-bit X/Y values. Finger 1 = bytes 33-36, finger 2 = bytes 37-40.
+    // UNVERIFIED against real hardware as of this milestone -- test before
+    // trusting for anything beyond initial debugging.
+    if buf.len() >= 43 {
+        s.finger1 = parse_touch_finger(&buf[35..39]);
+        s.finger2 = parse_touch_finger(&buf[39..43]);
+    }
+
     s
 }
 
@@ -244,7 +297,7 @@ pub fn calibrated_gyro_deg_s(state: &PadState, cal: &GyroCalibration) -> GyroDeg
 /// printing progress the same way Milestone 1's tool did. Shared by any
 /// binary that needs a ready-to-read device handle.
 pub fn open_and_calibrate(api: &hidapi::HidApi) -> Result<(HidDevice, GyroCalibration), String> {
-    let mut device = api
+    let device = api
         .open(SONY_VID, DS4_V2_PID)
         .map_err(|e| format!("could not open DS4 v2 (VID {SONY_VID:04X} PID {DS4_V2_PID:04X}): {e}"))?;
 
@@ -252,13 +305,10 @@ pub fn open_and_calibrate(api: &hidapi::HidApi) -> Result<(HidDevice, GyroCalibr
         .set_blocking_mode(false)
         .map_err(|e| format!("failed to set non-blocking mode: {e}"))?;
 
-    let cal = match read_calibration(&device) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("WARNING: {e} - gyro output will be uncalibrated (will drift).");
-            GyroCalibration::identity()
-        }
-    };
+    let cal = read_calibration(&device).unwrap_or_else(|e| {
+        eprintln!("WARNING: {e} - gyro output will be uncalibrated (will drift).");
+        GyroCalibration::identity()
+    });
 
     Ok((device, cal))
 }

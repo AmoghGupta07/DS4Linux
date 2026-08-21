@@ -26,3 +26,7 @@ path = "src/bin/passthrough_test.rs"
 [[bin]]
 name = "gyro_stick_test"
 path = "src/bin/gyro_stick_test.rs"
+
+[[bin]]
+name = "touchpad_test"
+path = "src/bin/touchpad_test.rs"

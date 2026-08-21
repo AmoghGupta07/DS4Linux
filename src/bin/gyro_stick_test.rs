@@ -84,7 +84,6 @@ fn main() {
 
     let gyro_cfg = GyroStickConfig {
         mode: MODE,
-        deg_per_sec_at_full_stick: 10000.0,
         ..Default::default()
     };
     let mut gyro_state = GyroStickState::default();
@@ -118,7 +117,7 @@ fn main() {
                 );
                 let (rx, ry) = gyro_stick::blend_and_clamp(state.rx, state.ry, gdx, gdy);
 
-                if let Err(e) = emit_state(&mut virtual_pad, &state, rx, state.ry) {
+                if let Err(e) = emit_state(&mut virtual_pad, &state, rx, ry) {
                     eprintln!("\nfailed to emit to virtual pad: {e}");
                 }
             }
