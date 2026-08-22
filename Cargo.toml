@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 hidapi = "2.6"
 libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "6"
 
 [lib]
 name = "ds4l"
@@ -30,3 +33,7 @@ path = "src/bin/gyro_stick_test.rs"
 [[bin]]
 name = "touchpad_test"
 path = "src/bin/touchpad_test.rs"
+
+[[bin]]
+name = "ds4l_daemon"
+path = "src/bin/ds4l_daemon.rs"

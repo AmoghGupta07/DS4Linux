@@ -15,14 +15,15 @@
 //! wrong gesture mapping would mean redoing this later.
 
 use crate::ds4_input::TouchFinger;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TouchpadMode {
     Passthrough,
     MouseRemap,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TouchpadConfig {
     pub mode: TouchpadMode,
     /// Mouse pixels of movement per unit of raw touchpad delta. DS4's

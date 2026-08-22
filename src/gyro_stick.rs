@@ -12,15 +12,16 @@
 //! matter of parsing into this struct, not restructuring this logic.
 
 use crate::ds4_input::PadState;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GyroMode {
     AlwaysOn,
     Toggle,
     Hold,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct GyroStickConfig {
     pub mode: GyroMode,
     /// Degrees/sec of gyro rotation that maps to full stick deflection.
