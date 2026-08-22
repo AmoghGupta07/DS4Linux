@@ -13,11 +13,31 @@
 //! `load` again with a different name), not a redesign.
 
 use crate::gyro_stick::GyroStickConfig;
+use crate::kbm::KbmConfig;
 use crate::touchpad::TouchpadConfig;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+
+/// Whole-profile output mode: either drives the virtual DS4 gamepad
+/// (existing behavior since Milestone 3), or drives keyboard/mouse
+/// output instead (kbm.rs) -- DS4Windows's "Controller" vs "Controls"
+/// distinction, confirmed against DS4Windows documentation before
+/// building this. Scoped per-profile rather than per-button, matching
+/// how this was deliberately scoped: create a separate KBM-mode profile
+/// rather than mixing both within one profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputMode {
+    Gamepad,
+    Kbm,
+}
+
+impl Default for OutputMode {
+    fn default() -> Self {
+        OutputMode::Gamepad
+    }
+}
 
 /// RGB lightbar color, 0-255 per channel -- matches DS4's native color
 /// range directly (no scaling needed when writing to the output report).
@@ -33,7 +53,7 @@ impl Default for LightbarColor {
         // Blue: DS4's own factory-default color when no profile has set
         // one, so a fresh install "looks like a normal DS4" rather than
         // an unexpected color.
-        LightbarColor { red: 125, green: 0, blue: 255 }
+        LightbarColor { red: 0, green: 0, blue: 255 }
     }
 }
 
@@ -75,6 +95,13 @@ pub struct Profile {
     /// Ds4FeedbackConfig::default() rather than erroring.
     #[serde(default)]
     pub feedback: Ds4FeedbackConfig,
+    /// Same backward-compatibility reasoning: profiles saved before this
+    /// milestone default to Gamepad mode (unchanged existing behavior)
+    /// rather than failing to load.
+    #[serde(default)]
+    pub output_mode: OutputMode,
+    #[serde(default)]
+    pub kbm: KbmConfig,
 }
 
 impl Default for Profile {
@@ -84,6 +111,8 @@ impl Default for Profile {
             gyro: GyroStickConfig::default(),
             touchpad: TouchpadConfig::default(),
             feedback: Ds4FeedbackConfig::default(),
+            output_mode: OutputMode::default(),
+            kbm: KbmConfig::default(),
         }
     }
 }

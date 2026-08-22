@@ -1,14 +1,17 @@
-//! Minimal virtual mouse via `/dev/uinput`, used for touchpad-as-mouse
-//! remap mode. Deliberately a SEPARATE device from VirtualDs4 -- a
-//! gamepad reporting EV_REL mouse deltas is not how Linux input semantics
-//! or games/the desktop interpret input; DS4Windows makes the same
-//! separation (a "virtual mouse" distinct from the virtual XInput/DS4
-//! pad) for the same reason.
+//! Minimal virtual keyboard+mouse via `/dev/uinput`, used for touchpad-
+//! as-mouse remap mode AND the KBM (keyboard/mouse) output mode. One
+//! combined device rather than two separate ones -- real USB "gaming
+//! mice" commonly report both EV_KEY (mouse buttons, sometimes extra
+//! programmable keys) and EV_REL on a single device, so this isn't an
+//! unusual shape for the kernel/desktop to see. Still a SEPARATE device
+//! from VirtualDs4 -- a gamepad reporting EV_REL/keyboard-style EV_KEY is
+//! not how Linux input semantics or games/the desktop interpret input;
+//! DS4Windows makes the same separation for the same reason.
 //!
 //! Reuses the same raw-ioctl approach as uinput_ds4.rs since the
 //! high-level `uinput` crate has the same VID/PID limitation here too
-//! (less critical for a mouse, but consistency keeps one code path to
-//! maintain instead of two).
+//! (less critical for a keyboard/mouse, but consistency keeps one code
+//! path to maintain instead of two).
 
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -82,7 +85,14 @@ pub struct VirtualMouse {
 }
 
 impl VirtualMouse {
-    pub fn create() -> io::Result<Self> {
+    /// `extra_keys` lets callers register additional EV_KEY codes beyond
+    /// the standard mouse buttons -- e.g. keyboard KEY_* codes needed for
+    /// KBM output mode. Each code must be individually enabled via
+    /// UI_SET_KEYBIT before it can be emitted; there is no known-safe way
+    /// to bulk-register an arbitrary range (unused/gap codes in that
+    /// range aren't confirmed safe to register), so this takes an
+    /// explicit list rather than a range.
+    pub fn create(extra_keys: &[u16]) -> io::Result<Self> {
         let file = OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -93,6 +103,9 @@ impl VirtualMouse {
             check(ioctl(fd, UI_SET_EVBIT, EV_KEY as i32))?;
             check(ioctl(fd, UI_SET_KEYBIT, BTN_LEFT as i32))?;
             check(ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT as i32))?;
+            for &key in extra_keys {
+                check(ioctl(fd, UI_SET_KEYBIT, key as i32))?;
+            }
 
             check(ioctl(fd, UI_SET_EVBIT, EV_REL as i32))?;
             check(ioctl(fd, UI_SET_RELBIT, REL_X as i32))?;

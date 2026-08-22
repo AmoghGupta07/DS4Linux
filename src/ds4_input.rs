@@ -301,7 +301,7 @@ pub fn calibrated_gyro_deg_s(state: &PadState, cal: &GyroCalibration) -> GyroDeg
 /// printing progress the same way Milestone 1's tool did. Shared by any
 /// binary that needs a ready-to-read device handle.
 pub fn open_and_calibrate(api: &hidapi::HidApi) -> Result<(HidDevice, GyroCalibration), String> {
-    let mut device = api
+    let device = api
         .open(SONY_VID, DS4_V2_PID)
         .map_err(|e| format!("could not open DS4 v2 (VID {SONY_VID:04X} PID {DS4_V2_PID:04X}): {e}"))?;
 

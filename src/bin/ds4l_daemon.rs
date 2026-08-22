@@ -24,7 +24,8 @@ use ds4l::ds4_input::{
     PadState,
 };
 use ds4l::gyro_stick::{self, GyroStickState};
-use ds4l::profile::{self, Profile};
+use ds4l::kbm::{self, KbmState, PressedKey};
+use ds4l::profile::{self, OutputMode, Profile};
 use ds4l::touchpad::{self, ClickButton, MouseAction, TouchpadMode, TouchpadMouseState};
 use ds4l::uinput_ds4::{self, VirtualDs4};
 use ds4l::uinput_mouse::{self, VirtualMouse};
@@ -93,6 +94,46 @@ fn emit_gamepad_state(
     pad.sync()
 }
 
+/// Applies one KbmFrame to the virtual keyboard+mouse device: presses
+/// newly-held keys/buttons, releases ones no longer held (diffing against
+/// KbmState::prev_pressed), and emits mouse movement. Only sends actual
+/// key events for the delta, not the full held set every report, to
+/// avoid flooding uinput with redundant repeated key-down events.
+fn apply_kbm_frame(
+    mouse: &mut VirtualMouse,
+    state: &mut KbmState,
+    frame: kbm::KbmFrame,
+) -> std::io::Result<()> {
+    let newly_pressed: Vec<PressedKey> = frame.held.difference(&state.prev_pressed).copied().collect();
+    let newly_released: Vec<PressedKey> = state.prev_pressed.difference(&frame.held).copied().collect();
+
+    for key in newly_pressed {
+        emit_pressed_key(mouse, key, true)?;
+    }
+    for key in newly_released {
+        emit_pressed_key(mouse, key, false)?;
+    }
+
+    if frame.mouse_dx != 0 {
+        mouse.emit_rel(uinput_mouse::REL_X, frame.mouse_dx)?;
+    }
+    if frame.mouse_dy != 0 {
+        mouse.emit_rel(uinput_mouse::REL_Y, frame.mouse_dy)?;
+    }
+    mouse.sync()?;
+
+    state.prev_pressed = frame.held;
+    Ok(())
+}
+
+fn emit_pressed_key(mouse: &mut VirtualMouse, key: PressedKey, pressed: bool) -> std::io::Result<()> {
+    match key {
+        PressedKey::Key(code) => mouse.emit_key(code, pressed),
+        PressedKey::MouseLeft => mouse.emit_key(uinput_mouse::BTN_LEFT, pressed),
+        PressedKey::MouseRight => mouse.emit_key(uinput_mouse::BTN_RIGHT, pressed),
+    }
+}
+
 fn main() {
     let profile_name = parse_args();
 
@@ -108,8 +149,8 @@ fn main() {
         }
     });
     println!(
-        "Profile loaded: gyro mode={:?} sensitivity={:.0}deg/s, touchpad mode={:?}",
-        profile.gyro.mode, profile.gyro.deg_per_sec_at_full_stick, profile.touchpad.mode
+        "Profile loaded: output mode={:?}, gyro mode={:?} sensitivity={:.0}deg/s, touchpad mode={:?}",
+        profile.output_mode, profile.gyro.mode, profile.gyro.deg_per_sec_at_full_stick, profile.touchpad.mode
     );
     if let Ok(path) = profile::profiles_dir() {
         println!(
@@ -167,14 +208,33 @@ fn main() {
         }
     }
 
-    println!("Creating virtual DS4 via uinput...");
-    let mut virtual_pad = VirtualDs4::create().unwrap_or_else(|e| {
-        eprintln!("Failed to create virtual DS4: {e}\nCheck /dev/uinput permissions.");
-        std::process::exit(1);
-    });
+    // Device creation branches on output_mode: Gamepad mode creates the
+    // virtual DS4 (plus an optional virtual mouse for touchpad remap);
+    // Kbm mode creates only the combined keyboard+mouse device, since
+    // there's no virtual gamepad to drive in that mode.
+    let mut virtual_pad = if profile.output_mode == OutputMode::Gamepad {
+        Some(VirtualDs4::create().unwrap_or_else(|e| {
+            eprintln!("Failed to create virtual DS4: {e}\nCheck /dev/uinput permissions.");
+            std::process::exit(1);
+        }))
+    } else {
+        None
+    };
 
-    let mut virtual_mouse = if profile.touchpad.mode == TouchpadMode::MouseRemap {
-        Some(VirtualMouse::create().unwrap_or_else(|e| {
+    let needs_mouse_device = profile.output_mode == OutputMode::Kbm
+        || (profile.output_mode == OutputMode::Gamepad
+            && profile.touchpad.mode == TouchpadMode::MouseRemap);
+    let mut virtual_mouse = if needs_mouse_device {
+        // KBM mode needs every key code its mapping actually uses
+        // registered up front; touchpad-only MouseRemap mode (Gamepad
+        // output) doesn't need any keyboard keys, just the base mouse
+        // buttons uinput_mouse::create always registers.
+        let extra_keys: Vec<u16> = if profile.output_mode == OutputMode::Kbm {
+            collect_mapped_keys(&profile.kbm)
+        } else {
+            Vec::new()
+        };
+        Some(VirtualMouse::create(&extra_keys).unwrap_or_else(|e| {
             eprintln!("Failed to create virtual mouse: {e}\nCheck /dev/uinput permissions.");
             std::process::exit(1);
         }))
@@ -186,71 +246,93 @@ fn main() {
 
     let mut gyro_state = GyroStickState::default();
     let mut touchpad_mouse_state = TouchpadMouseState::default();
+    let mut kbm_state = KbmState::default();
 
     let mut buf = [0u8; 64];
     loop {
         match device.read_timeout(&mut buf, 100) {
             Ok(len) if len >= 25 && buf[0] == 0x01 => {
                 let state = parse_report(&buf);
-                let gyro = calibrated_gyro_deg_s(&state, &cal);
 
-                let (gdx, gdy) = gyro_stick::compute_gyro_stick_delta(
-                    &mut gyro_state,
-                    &profile.gyro,
-                    &state,
-                    gyro.yaw,
-                    gyro.pitch,
-                );
-                let (rx, ry) = gyro_stick::blend_and_clamp(state.rx, state.ry, gdx, gdy);
-
-                if let Err(e) =
-                    emit_gamepad_state(&mut virtual_pad, &state, rx, ry, profile.touchpad.mode)
-                {
-                    eprintln!("\nfailed to emit gamepad state: {e}");
-                }
-
-                if profile.touchpad.mode == TouchpadMode::MouseRemap {
-                    if let Some(mouse) = virtual_mouse.as_mut() {
-                        let action = touchpad::compute_mouse_action(
-                            &mut touchpad_mouse_state,
-                            &profile.touchpad,
-                            &state.finger1,
-                            &state.finger2,
-                        );
-
-                        let motion_result = match action {
-                            MouseAction::None => Ok(()),
-                            MouseAction::Move { dx, dy } => mouse
-                                .emit_rel(uinput_mouse::REL_X, dx)
-                                .and_then(|_| mouse.emit_rel(uinput_mouse::REL_Y, dy))
-                                .and_then(|_| mouse.sync()),
-                            MouseAction::Scroll { amount } => {
-                                mouse.emit_wheel(amount).and_then(|_| mouse.sync())
+                match profile.output_mode {
+                    OutputMode::Kbm => {
+                        if let Some(mouse) = virtual_mouse.as_mut() {
+                            let frame = kbm::compute_frame(&state, &profile.kbm, &mut kbm_state);
+                            if let Err(e) = apply_kbm_frame(mouse, &mut kbm_state, frame) {
+                                eprintln!("\nfailed to emit KBM frame: {e}");
                             }
-                        };
-                        if let Err(e) = motion_result {
-                            eprintln!("\nfailed to emit mouse motion/scroll: {e}");
+                        }
+                    }
+                    OutputMode::Gamepad => {
+                        let gyro = calibrated_gyro_deg_s(&state, &cal);
+
+                        let (gdx, gdy) = gyro_stick::compute_gyro_stick_delta(
+                            &mut gyro_state,
+                            &profile.gyro,
+                            &state,
+                            gyro.yaw,
+                            gyro.pitch,
+                        );
+                        let (rx, ry) = gyro_stick::blend_and_clamp(state.rx, state.ry, gdx, gdy);
+
+                        if let Some(pad) = virtual_pad.as_mut() {
+                            if let Err(e) = emit_gamepad_state(
+                                pad,
+                                &state,
+                                rx,
+                                ry,
+                                profile.touchpad.mode,
+                            ) {
+                                eprintln!("\nfailed to emit gamepad state: {e}");
+                            }
                         }
 
-                        let finger_count =
-                            state.finger1.touching as u8 + state.finger2.touching as u8;
-                        let click_target = touchpad::click_button_for_finger_count(finger_count);
+                        if profile.touchpad.mode == TouchpadMode::MouseRemap {
+                            if let Some(mouse) = virtual_mouse.as_mut() {
+                                let action = touchpad::compute_mouse_action(
+                                    &mut touchpad_mouse_state,
+                                    &profile.touchpad,
+                                    &state.finger1,
+                                    &state.finger2,
+                                );
 
-                        let click_result = mouse
-                            .emit_key(
-                                uinput_mouse::BTN_LEFT,
-                                state.touchpad_click && click_target == Some(ClickButton::Left),
-                            )
-                            .and_then(|_| {
-                                mouse.emit_key(
-                                    uinput_mouse::BTN_RIGHT,
-                                    state.touchpad_click
-                                        && click_target == Some(ClickButton::Right),
-                                )
-                            })
-                            .and_then(|_| mouse.sync());
-                        if let Err(e) = click_result {
-                            eprintln!("\nfailed to emit mouse click: {e}");
+                                let motion_result = match action {
+                                    MouseAction::None => Ok(()),
+                                    MouseAction::Move { dx, dy } => mouse
+                                        .emit_rel(uinput_mouse::REL_X, dx)
+                                        .and_then(|_| mouse.emit_rel(uinput_mouse::REL_Y, dy))
+                                        .and_then(|_| mouse.sync()),
+                                    MouseAction::Scroll { amount } => {
+                                        mouse.emit_wheel(amount).and_then(|_| mouse.sync())
+                                    }
+                                };
+                                if let Err(e) = motion_result {
+                                    eprintln!("\nfailed to emit mouse motion/scroll: {e}");
+                                }
+
+                                let finger_count =
+                                    state.finger1.touching as u8 + state.finger2.touching as u8;
+                                let click_target =
+                                    touchpad::click_button_for_finger_count(finger_count);
+
+                                let click_result = mouse
+                                    .emit_key(
+                                        uinput_mouse::BTN_LEFT,
+                                        state.touchpad_click
+                                            && click_target == Some(ClickButton::Left),
+                                    )
+                                    .and_then(|_| {
+                                        mouse.emit_key(
+                                            uinput_mouse::BTN_RIGHT,
+                                            state.touchpad_click
+                                                && click_target == Some(ClickButton::Right),
+                                        )
+                                    })
+                                    .and_then(|_| mouse.sync());
+                                if let Err(e) = click_result {
+                                    eprintln!("\nfailed to emit mouse click: {e}");
+                                }
+                            }
                         }
                     }
                 }
@@ -262,4 +344,45 @@ fn main() {
             }
         }
     }
+}
+
+/// Collects every distinct KEY_* code a KbmConfig actually maps to, so
+/// the virtual keyboard device only registers the key bits it needs
+/// rather than guessing a broad range (see uinput_mouse.rs's doc comment
+/// on why we don't bulk-register an unverified range of codes).
+fn collect_mapped_keys(cfg: &ds4l::kbm::KbmConfig) -> Vec<u16> {
+    use ds4l::kbm::{KbmTarget, StickKbmMode};
+    let mut keys = std::collections::HashSet::new();
+    let mut add = |t: KbmTarget| {
+        if let KbmTarget::Key(k) = t {
+            keys.insert(k);
+        }
+    };
+    add(cfg.cross);
+    add(cfg.circle);
+    add(cfg.triangle);
+    add(cfg.square);
+    add(cfg.l1);
+    add(cfg.r1);
+    add(cfg.l2);
+    add(cfg.r2);
+    add(cfg.l3);
+    add(cfg.r3);
+    add(cfg.share);
+    add(cfg.options);
+    add(cfg.ps);
+    add(cfg.touchpad_click);
+    add(cfg.dpad_up);
+    add(cfg.dpad_down);
+    add(cfg.dpad_left);
+    add(cfg.dpad_right);
+    for stick in [&cfg.left_stick, &cfg.right_stick] {
+        if let StickKbmMode::Digital { up, down, left, right, .. } = stick {
+            add(*up);
+            add(*down);
+            add(*left);
+            add(*right);
+        }
+    }
+    keys.into_iter().collect()
 }

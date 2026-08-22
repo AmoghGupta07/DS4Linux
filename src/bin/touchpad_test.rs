@@ -107,7 +107,7 @@ fn main() {
     // Only spin up the virtual mouse if we're actually in MouseRemap mode
     // -- no point creating an unused input device otherwise.
     let mut virtual_mouse = if TOUCHPAD_MODE == TouchpadMode::MouseRemap {
-        Some(VirtualMouse::create().unwrap_or_else(|e| {
+        Some(VirtualMouse::create(&[]).unwrap_or_else(|e| {
             eprintln!("Failed to create virtual mouse: {e}\nCheck /dev/uinput permissions.");
             std::process::exit(1);
         }))
