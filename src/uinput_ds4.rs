@@ -50,7 +50,7 @@ pub const ABS_RZ: u16 = 0x05; // R2 analog
 pub const ABS_HAT0X: u16 = 0x10; // dpad X
 pub const ABS_HAT0Y: u16 = 0x11; // dpad Y
 
-// Multitouch axes (single-finger only this milestone -- slot 0 always).
+// Multitouch axes -- 2 slots, matching DS4's real 2-finger touchpad.
 // DS4's real touchpad resolution is ~1920x942 units; we mirror that range
 // here rather than 0-255 since touchpad coordinates are finer-grained than
 // stick axes and games/SDL expect DS4's actual reported resolution.
@@ -60,6 +60,7 @@ pub const ABS_MT_POSITION_X: u16 = 0x35;
 pub const ABS_MT_POSITION_Y: u16 = 0x36;
 pub const DS4_TOUCHPAD_MAX_X: i32 = 1919;
 pub const DS4_TOUCHPAD_MAX_Y: i32 = 941;
+pub const DS4_TOUCHPAD_MAX_SLOTS: i32 = 1; // slot indices 0 and 1 (2 fingers)
 
 const BUS_USB: u16 = 0x03;
 
@@ -186,7 +187,7 @@ impl VirtualDs4 {
             // Tracking ID -1 means "no contact" -- standard evdev MT
             // protocol B convention, matches how the kernel's own DS4
             // driver reports touchpad lift.
-            setup_abs(fd, ABS_MT_SLOT, 0, 0, 0, 0, 0)?; // single slot only
+            setup_abs(fd, ABS_MT_SLOT, 0, DS4_TOUCHPAD_MAX_SLOTS, 0, 0, 0)?; // slots 0 and 1
             setup_abs(fd, ABS_MT_TRACKING_ID, -1, 65535, -1, 0, 0)?;
             setup_abs(fd, ABS_MT_POSITION_X, 0, DS4_TOUCHPAD_MAX_X, 0, 0, 0)?;
             setup_abs(fd, ABS_MT_POSITION_Y, 0, DS4_TOUCHPAD_MAX_Y, 0, 0, 0)?;
@@ -238,20 +239,26 @@ impl VirtualDs4 {
     ///
     /// Follows evdev's MT protocol B sequence: select slot, then update
     /// tracking ID (and position, if touching) within that slot. BTN_TOUCH
-    /// is also driven here since some consumers (older SDL, non-MT-aware
-    /// code) read that instead of/alongside the MT axes.
-    /// Follows evdev's MT protocol B sequence: select slot, then update
-    /// tracking ID (and position, if touching) within that slot. BTN_TOUCH
     /// is emitted first, per the kernel's documented requirement that
     /// "BTN_TOUCH must be the first evdev code emitted in a
     /// synchronization frame" for correct legacy mousedev/pointer
     /// emulation -- some consumers (older SDL, non-MT-aware code) rely on
-    /// this ordering.
-    pub fn emit_touch(&mut self, touching: bool, x: i32, y: i32) -> io::Result<()> {
-        self.emit_key(BTN_TOUCH, touching)?;
-        self.emit_abs(ABS_MT_SLOT, 0)?;
+    /// this ordering. Only emitted for slot 0, since BTN_TOUCH is a
+    /// single-touch-compat signal (true if *any* finger touches), not
+    /// per-slot -- calling this for slot 1 with `touching=false` while
+    /// slot 0 is still down would otherwise incorrectly clear BTN_TOUCH.
+    ///
+    /// `slot` is 0 (first finger) or 1 (second finger), matching DS4's
+    /// real 2-finger touchpad. Tracking ID uses `slot` itself as a simple
+    /// stable ID per finger -- adequate since we don't need ID reuse
+    /// tracking across lift/re-touch for this milestone's use cases.
+    pub fn emit_touch(&mut self, slot: i32, touching: bool, x: i32, y: i32) -> io::Result<()> {
+        if slot == 0 {
+            self.emit_key(BTN_TOUCH, touching)?;
+        }
+        self.emit_abs(ABS_MT_SLOT, slot)?;
         if touching {
-            self.emit_abs(ABS_MT_TRACKING_ID, 0)?;
+            self.emit_abs(ABS_MT_TRACKING_ID, slot)?;
             self.emit_abs(ABS_MT_POSITION_X, x.clamp(0, DS4_TOUCHPAD_MAX_X))?;
             self.emit_abs(ABS_MT_POSITION_Y, y.clamp(0, DS4_TOUCHPAD_MAX_Y))?;
         } else {

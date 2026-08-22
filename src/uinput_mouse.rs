@@ -26,6 +26,7 @@ pub const BTN_LEFT: u16 = 0x110;
 pub const BTN_RIGHT: u16 = 0x111;
 pub const REL_X: u16 = 0x00;
 pub const REL_Y: u16 = 0x01;
+pub const REL_WHEEL: u16 = 0x08;
 
 const BUS_USB: u16 = 0x03;
 const UINPUT_MAX_NAME_SIZE: usize = 80;
@@ -96,6 +97,7 @@ impl VirtualMouse {
             check(ioctl(fd, UI_SET_EVBIT, EV_REL as i32))?;
             check(ioctl(fd, UI_SET_RELBIT, REL_X as i32))?;
             check(ioctl(fd, UI_SET_RELBIT, REL_Y as i32))?;
+            check(ioctl(fd, UI_SET_RELBIT, REL_WHEEL as i32))?;
 
             let mut name = [0i8; UINPUT_MAX_NAME_SIZE];
             let cname = CString::new("ds4l Virtual Touchpad Mouse").unwrap();
@@ -128,6 +130,10 @@ impl VirtualMouse {
 
     pub fn emit_rel(&mut self, code: u16, value: i32) -> io::Result<()> {
         self.write_event(EV_REL, code, value)
+    }
+
+    pub fn emit_wheel(&mut self, detents: i32) -> io::Result<()> {
+        self.write_event(EV_REL, REL_WHEEL, detents)
     }
 
     pub fn emit_key(&mut self, code: u16, pressed: bool) -> io::Result<()> {

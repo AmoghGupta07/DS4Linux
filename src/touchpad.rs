@@ -6,6 +6,13 @@
 //! deltas into relative mouse motion on a separate virtual mouse device.
 //! Selected per config for now (stand-in for the future per-profile
 //! setting), matching the same pattern as gyro_stick's GyroMode.
+//!
+//! MouseRemap's 2-finger behavior follows DS4Windows's confirmed
+//! convention: 1 finger drags the cursor, 2 fingers scroll instead
+//! (vertical), and clicking with 2 fingers down is a right-click instead
+//! of left-click. This was verified against DS4Windows documentation/
+//! guides before implementing, rather than assumed, since building the
+//! wrong gesture mapping would mean redoing this later.
 
 use crate::ds4_input::TouchFinger;
 
@@ -22,55 +29,80 @@ pub struct TouchpadConfig {
     /// touchpad is ~1920x942 units; this scale is a starting point for
     /// "moderate" mouse feel, tune by preference.
     pub mouse_sensitivity: f64,
+    /// Scroll "clicks" per unit of raw touchpad Y delta during 2-finger
+    /// drag. Separate from mouse_sensitivity since scroll and cursor
+    /// speed are typically tuned independently by feel.
+    pub scroll_sensitivity: f64,
 }
 
 impl Default for TouchpadConfig {
     fn default() -> Self {
         TouchpadConfig {
             mode: TouchpadMode::MouseRemap,
-            mouse_sensitivity: 1.5,
+            mouse_sensitivity: 0.5,
+            scroll_sensitivity: 0.05,
         }
     }
 }
 
-/// Tracks the previous finger position so MouseRemap mode can compute a
-/// delta between reports, since the touchpad reports absolute position,
-/// not relative motion -- relative deltas are what EV_REL mouse movement
-/// needs. Also tracks whether the finger was down last frame, so a
-/// fresh touch-down doesn't produce a spurious large jump from wherever
-/// the finger last was before lifting.
+/// What the mouse-remap layer wants to happen this frame. Kept as a single
+/// enum rather than several loosely-related Option<T> fields so the
+/// caller can match exhaustively and can't accidentally act on stale
+/// cursor-move data during a scroll frame, or vice versa.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MouseAction {
+    None,
+    Move { dx: i32, dy: i32 },
+    Scroll { amount: i32 },
+}
+
+/// Tracks per-touch state across reports so MouseRemap mode can compute
+/// deltas (the touchpad reports absolute position, not relative motion)
+/// and detect finger-count transitions (1->2 fingers mid-drag, etc).
 #[derive(Debug, Default)]
 pub struct TouchpadMouseState {
     prev_x: i32,
     prev_y: i32,
-    was_touching: bool,
+    /// 0, 1, or 2 -- finger count as of the last processed report. Used
+    /// to detect transitions so a switch from 1 to 2 fingers (or back)
+    /// resets the delta baseline instead of producing one large spurious
+    /// jump from finger1's last position to finger2's current position.
+    prev_finger_count: u8,
 }
 
-/// Computes the (dx, dy) mouse delta for this frame given the current
-/// finger state, or None if there's no motion to report (finger not
-/// touching, or this is the first frame of a new touch with nothing to
-/// diff against yet).
-pub fn compute_mouse_delta(
+/// Determines what mouse action (if any) this frame's touch state should
+/// produce, and updates `state` for the next call. This is the single
+/// entry point mouse-remap mode needs -- caller doesn't need to reason
+/// about finger-count branching itself.
+pub fn compute_mouse_action(
     state: &mut TouchpadMouseState,
     cfg: &TouchpadConfig,
-    finger: &TouchFinger,
-) -> Option<(i32, i32)> {
-    if !finger.touching {
-        state.was_touching = false;
-        return None;
+    finger1: &TouchFinger,
+    finger2: &TouchFinger,
+) -> MouseAction {
+    let finger_count: u8 = finger1.touching as u8 + finger2.touching as u8;
+
+    if finger_count == 0 {
+        state.prev_finger_count = 0;
+        return MouseAction::None;
     }
 
-    let x = finger.x as i32;
-    let y = finger.y as i32;
+    // Use finger1's position as the tracked point in both 1-finger and
+    // 2-finger modes -- finger1 is present whenever any finger is down
+    // (the controller always fills finger1 before finger2), so this stays
+    // consistent rather than needing to pick whichever finger is "active."
+    let x = finger1.x as i32;
+    let y = finger1.y as i32;
 
-    if !state.was_touching {
-        // Finger just touched down -- record position but don't emit a
-        // delta yet, since there's no previous position on this touch to
-        // diff against (would otherwise jump from last touch's endpoint).
+    // Finger count changed since last frame (0->1, 1->2, 2->1) -- reset
+    // the delta baseline instead of diffing against a position that came
+    // from a different touch context, which would otherwise produce one
+    // large spurious jump/scroll on every transition.
+    if finger_count != state.prev_finger_count {
         state.prev_x = x;
         state.prev_y = y;
-        state.was_touching = true;
-        return None;
+        state.prev_finger_count = finger_count;
+        return MouseAction::None;
     }
 
     let raw_dx = x - state.prev_x;
@@ -79,11 +111,44 @@ pub fn compute_mouse_delta(
     state.prev_y = y;
 
     if raw_dx == 0 && raw_dy == 0 {
-        return None;
+        return MouseAction::None;
     }
 
-    let dx = (raw_dx as f64 * cfg.mouse_sensitivity).round() as i32;
-    let dy = (raw_dy as f64 * cfg.mouse_sensitivity).round() as i32;
+    if finger_count == 1 {
+        let dx = (raw_dx as f64 * cfg.mouse_sensitivity).round() as i32;
+        let dy = (raw_dy as f64 * cfg.mouse_sensitivity).round() as i32;
+        if dx == 0 && dy == 0 {
+            MouseAction::None
+        } else {
+            MouseAction::Move { dx, dy }
+        }
+    } else {
+        // 2 fingers: vertical drag -> scroll, matching DS4Windows's
+        // "Two Finger Slide" = Scroll convention. Horizontal movement is
+        // ignored for now (no horizontal scroll this milestone).
+        let amount = (raw_dy as f64 * cfg.scroll_sensitivity).round() as i32;
+        if amount == 0 {
+            MouseAction::None
+        } else {
+            MouseAction::Scroll { amount }
+        }
+    }
+}
 
-    Some((dx, dy))
+/// Whether a touchpad click while `finger_count` fingers are down should
+/// be a left or right click, per DS4Windows convention (1 finger =
+/// left, 2 fingers = right). Returns None for 0 fingers (click with no
+/// finger contact shouldn't normally happen, but handled defensively).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickButton {
+    Left,
+    Right,
+}
+
+pub fn click_button_for_finger_count(finger_count: u8) -> Option<ClickButton> {
+    match finger_count {
+        1 => Some(ClickButton::Left),
+        2 => Some(ClickButton::Right),
+        _ => None,
+    }
 }

@@ -1,11 +1,13 @@
-// Milestone 4: touchpad support, both modes.
+// Milestone 4 (+2-finger extension): touchpad support, both modes, up to
+// 2 simultaneous fingers.
 //
-// - Passthrough mode: real finger position -> virtual DS4's multitouch
-//   axes, for games that read the DS4 touchpad natively.
-// - MouseRemap mode: finger movement -> relative mouse deltas on a
-//   separate virtual mouse device, DS4Windows-style.
+// - Passthrough mode: real finger positions -> virtual DS4's multitouch
+//   axes (both slots), for games that read the DS4 touchpad natively.
+// - MouseRemap mode: 1 finger drags the cursor; 2 fingers scroll instead
+//   (vertical) and switch click-to-right-click -- confirmed DS4Windows
+//   convention ("Two Finger Slide" = Scroll, 2-finger press = right
+//   click), not an invented behavior.
 //
-// Single-finger only this milestone (finger 2 parsed but unused).
 // Everything from Milestone 3.5 (gyro-to-right-stick, passthrough for
 // sticks/buttons/dpad/triggers) is unchanged and still active.
 //
@@ -14,7 +16,7 @@
 
 use ds4l::ds4_input::{calibrated_gyro_deg_s, open_and_calibrate, parse_report, PadState};
 use ds4l::gyro_stick::{self, GyroMode, GyroStickConfig, GyroStickState};
-use ds4l::touchpad::{self, TouchpadConfig, TouchpadMode, TouchpadMouseState};
+use ds4l::touchpad::{self, ClickButton, MouseAction, TouchpadConfig, TouchpadMode, TouchpadMouseState};
 use ds4l::uinput_ds4::{self, VirtualDs4};
 use ds4l::uinput_mouse::{self, VirtualMouse};
 use hidapi::HidApi;
@@ -70,9 +72,16 @@ fn emit_gamepad_state(
 
     if touchpad_mode == TouchpadMode::Passthrough {
         pad.emit_touch(
+            0,
             state.finger1.touching,
             state.finger1.x as i32,
             state.finger1.y as i32,
+        )?;
+        pad.emit_touch(
+            1,
+            state.finger2.touching,
+            state.finger2.x as i32,
+            state.finger2.y as i32,
         )?;
     }
 
@@ -126,7 +135,8 @@ fn main() {
     println!(
         "\nTouchpad mode: {mode_desc}\n\
          Gyro-to-right-stick: {:?} (gate: L2)\n\
-         Single finger only this milestone.\n\
+         2-finger support: MouseRemap = scroll + right-click, \
+         Passthrough = both slots.\n\
          Ctrl+C to quit.\n",
         GYRO_MODE
     );
@@ -155,24 +165,48 @@ fn main() {
 
                 if touchpad_cfg.mode == TouchpadMode::MouseRemap {
                     if let Some(mouse) = virtual_mouse.as_mut() {
-                        if let Some((dx, dy)) = touchpad::compute_mouse_delta(
+                        let action = touchpad::compute_mouse_action(
                             &mut touchpad_mouse_state,
                             &touchpad_cfg,
                             &state.finger1,
-                        ) {
-                            let result = mouse
+                            &state.finger2,
+                        );
+
+                        let motion_result = match action {
+                            MouseAction::None => Ok(()),
+                            MouseAction::Move { dx, dy } => mouse
                                 .emit_rel(uinput_mouse::REL_X, dx)
                                 .and_then(|_| mouse.emit_rel(uinput_mouse::REL_Y, dy))
-                                .and_then(|_| mouse.sync());
-                            if let Err(e) = result {
-                                eprintln!("\nfailed to emit mouse motion: {e}");
+                                .and_then(|_| mouse.sync()),
+                            MouseAction::Scroll { amount } => {
+                                mouse.emit_wheel(amount).and_then(|_| mouse.sync())
                             }
+                        };
+                        if let Err(e) = motion_result {
+                            eprintln!("\nfailed to emit mouse motion/scroll: {e}");
                         }
-                        // Touchpad click doubles as left mouse button in
-                        // this mode, matching common DS4Windows touchpad
-                        // remap defaults.
+
+                        // Click button depends on how many fingers are down
+                        // at the moment of the click: 1 finger = left,
+                        // 2 fingers = right (confirmed DS4Windows
+                        // convention). Only fires the button matching the
+                        // current finger count; the other stays released.
+                        let finger_count =
+                            state.finger1.touching as u8 + state.finger2.touching as u8;
+                        let click_target = touchpad::click_button_for_finger_count(finger_count);
+
                         let click_result = mouse
-                            .emit_key(uinput_mouse::BTN_LEFT, state.touchpad_click)
+                            .emit_key(
+                                uinput_mouse::BTN_LEFT,
+                                state.touchpad_click && click_target == Some(ClickButton::Left),
+                            )
+                            .and_then(|_| {
+                                mouse.emit_key(
+                                    uinput_mouse::BTN_RIGHT,
+                                    state.touchpad_click
+                                        && click_target == Some(ClickButton::Right),
+                                )
+                            })
                             .and_then(|_| mouse.sync());
                         if let Err(e) = click_result {
                             eprintln!("\nfailed to emit mouse click: {e}");
