@@ -2,9 +2,13 @@
 // drives gyro-to-stick + touchpad (both modes, 2-finger) from it, instead
 // of the hardcoded consts the earlier test binaries used. Left stick,
 // buttons, dpad, triggers still pass through 1:1 as they have since
-// Milestone 3 -- this milestone is entirely about making the *tunable*
-// parts (gyro mode/sensitivity, touchpad mode/sensitivity) configurable
-// without a rebuild.
+// Milestone 3.
+//
+// On connect: sets the lightbar to the profile's configured color, and
+// (if enabled) pulses rumble briefly -- confirms the daemon connected and
+// loaded the right profile without needing to check a terminal. This is
+// the first milestone that WRITES to the controller (HID output report
+// 0x05) rather than only reading from it.
 //
 // Usage:
 //   ds4l_daemon                 # loads/creates the "Default" profile
@@ -15,7 +19,10 @@
 // (Live-reload without restart is a natural follow-up once this is
 // confirmed working, not included this milestone.)
 
-use ds4l::ds4_input::{calibrated_gyro_deg_s, open_and_calibrate, parse_report, PadState};
+use ds4l::ds4_input::{
+    calibrated_gyro_deg_s, open_and_calibrate, parse_report, send_output_report, OutputReport,
+    PadState,
+};
 use ds4l::gyro_stick::{self, GyroStickState};
 use ds4l::profile::{self, Profile};
 use ds4l::touchpad::{self, ClickButton, MouseAction, TouchpadMode, TouchpadMouseState};
@@ -120,6 +127,45 @@ fn main() {
         std::process::exit(1);
     });
     println!("Real DS4 connected, calibration loaded.");
+
+    // Set lightbar color immediately, and pulse rumble briefly if this
+    // profile requests it -- confirms the right profile loaded without
+    // needing to look at a terminal. Errors here are logged but not
+    // fatal: a lightbar/rumble failure shouldn't stop the daemon from
+    // otherwise functioning normally.
+    let lb = profile.feedback.lightbar;
+    let led_report = OutputReport {
+        led_red: lb.red,
+        led_green: lb.green,
+        led_blue: lb.blue,
+        set_led: true,
+        ..Default::default()
+    };
+    if let Err(e) = send_output_report(&device, &led_report) {
+        eprintln!("Warning: failed to set lightbar color: {e}");
+    }
+
+    if profile.feedback.rumble_on_load {
+        let pulse_on = OutputReport {
+            rumble_weak: 150,
+            rumble_strong: 150,
+            set_rumble: true,
+            ..Default::default()
+        };
+        if let Err(e) = send_output_report(&device, &pulse_on) {
+            eprintln!("Warning: failed to start rumble pulse: {e}");
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let pulse_off = OutputReport {
+            rumble_weak: 0,
+            rumble_strong: 0,
+            set_rumble: true,
+            ..Default::default()
+        };
+        if let Err(e) = send_output_report(&device, &pulse_off) {
+            eprintln!("Warning: failed to stop rumble pulse: {e}");
+        }
+    }
 
     println!("Creating virtual DS4 via uinput...");
     let mut virtual_pad = VirtualDs4::create().unwrap_or_else(|e| {

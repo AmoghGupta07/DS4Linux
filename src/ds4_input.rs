@@ -257,15 +257,19 @@ pub fn parse_report(buf: &[u8]) -> PadState {
     s.accel_y = read_i16_le(buf, 21);
     s.accel_z = read_i16_le(buf, 23);
 
-    // Touchpad: confirmed from Linux kernel hid-sony.c source (patch
-    // comment: "multi-touch trackpad data starts at offset 33 on USB and
-    // 35 on Bluetooth"), cross-checked against the community
-    // TouchFingerData struct layout (Game Controller Collective wiki).
-    // Each finger is 4 bytes: byte0 bit7 = NOT touching (inverted -- 0
-    // means finger IS down), bits 0-6 = contact id; bytes 1-3 pack two
-    // 12-bit X/Y values. Finger 1 = bytes 33-36, finger 2 = bytes 37-40.
-    // UNVERIFIED against real hardware as of this milestone -- test before
-    // trusting for anything beyond initial debugging.
+    // Touchpad: the kernel patch's "trackpad data starts at offset 33"
+    // refers to the START of the touchpad block, which begins with a
+    // packet counter/timestamp byte (offset 33) and a second byte
+    // (offset 34, purpose unclear/padding) BEFORE finger 1's actual
+    // contact byte. This was confirmed against a second, independent
+    // source (DsHidMini GitHub issue #11, citing psdevwiki): "the MSB of
+    // Byte 35... finger 1 is in contact... MSB of Byte 39... finger 2."
+    // My first version incorrectly treated offset 33 as finger 1's
+    // contact byte directly, causing it to read the counter/timestamp
+    // byte as if it were touch data -- explaining the "moving in a loop
+    // while stationary" symptom (a free-running counter cycling through
+    // its range looks exactly like that when misread as position bits).
+    // Finger 1 = bytes 35-38, finger 2 = bytes 39-42.
     if buf.len() >= 43 {
         s.finger1 = parse_touch_finger(&buf[35..39]);
         s.finger2 = parse_touch_finger(&buf[39..43]);
@@ -297,7 +301,7 @@ pub fn calibrated_gyro_deg_s(state: &PadState, cal: &GyroCalibration) -> GyroDeg
 /// printing progress the same way Milestone 1's tool did. Shared by any
 /// binary that needs a ready-to-read device handle.
 pub fn open_and_calibrate(api: &hidapi::HidApi) -> Result<(HidDevice, GyroCalibration), String> {
-    let device = api
+    let mut device = api
         .open(SONY_VID, DS4_V2_PID)
         .map_err(|e| format!("could not open DS4 v2 (VID {SONY_VID:04X} PID {DS4_V2_PID:04X}): {e}"))?;
 
@@ -305,10 +309,81 @@ pub fn open_and_calibrate(api: &hidapi::HidApi) -> Result<(HidDevice, GyroCalibr
         .set_blocking_mode(false)
         .map_err(|e| format!("failed to set non-blocking mode: {e}"))?;
 
-    let cal = read_calibration(&device).unwrap_or_else(|e| {
-        eprintln!("WARNING: {e} - gyro output will be uncalibrated (will drift).");
-        GyroCalibration::identity()
-    });
+    let cal = match read_calibration(&device) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("WARNING: {e} - gyro output will be uncalibrated (will drift).");
+            GyroCalibration::identity()
+        }
+    };
 
     Ok((device, cal))
+}
+
+/// Sends a USB output report (0x05) to set rumble motors and/or lightbar
+/// color/blink. Layout confirmed against two independent sources: the
+/// actual hid-playstation.c kernel driver (dualshock4_output_report_common
+/// struct, LKML patch series) and the Game Controller Collective wiki's
+/// USBSetStateData struct, which agree byte-for-byte.
+///
+/// The controller only applies fields whose "enable" flag is set in
+/// valid_flag0 -- this lets a single report update just rumble, just the
+/// lightbar, or both, without disturbing whichever part isn't flagged.
+pub struct OutputReport {
+    pub rumble_weak: u8,   // "motor_right" in kernel naming
+    pub rumble_strong: u8, // "motor_left" in kernel naming
+    pub led_red: u8,
+    pub led_green: u8,
+    pub led_blue: u8,
+    pub led_blink_on: u8,
+    pub led_blink_off: u8,
+    pub set_rumble: bool,
+    pub set_led: bool,
+}
+
+impl Default for OutputReport {
+    fn default() -> Self {
+        OutputReport {
+            rumble_weak: 0,
+            rumble_strong: 0,
+            led_red: 0,
+            led_green: 0,
+            led_blue: 0,
+            led_blink_on: 0,
+            led_blink_off: 0,
+            set_rumble: false,
+            set_led: false,
+        }
+    }
+}
+
+pub fn send_output_report(device: &HidDevice, report: &OutputReport) -> Result<(), String> {
+    let mut buf = [0u8; 32]; // DS4_OUTPUT_REPORT_USB_SIZE per kernel source
+    buf[0] = 0x05; // DS4_OUTPUT_REPORT_USB
+
+    let mut valid_flag0: u8 = 0;
+    if report.set_rumble {
+        valid_flag0 |= 0x01; // EnableRumbleUpdate
+    }
+    if report.set_led {
+        valid_flag0 |= 0x02; // EnableLedUpdate
+        valid_flag0 |= 0x04; // EnableLedBlink -- always set alongside LED
+                              // update so blink_on/off (0 = solid, no
+                              // blink) is honored rather than ignored.
+    }
+    buf[1] = valid_flag0;
+    // buf[2] = valid_flag1, unused for rumble/LED -- leave 0.
+    // buf[3] = reserved -- leave 0.
+    buf[4] = report.rumble_weak;
+    buf[5] = report.rumble_strong;
+    buf[6] = report.led_red;
+    buf[7] = report.led_green;
+    buf[8] = report.led_blue;
+    buf[9] = report.led_blink_on;
+    buf[10] = report.led_blink_off;
+
+    device
+        .write(&buf)
+        .map_err(|e| format!("failed to write output report: {e}"))?;
+    Ok(())
 }

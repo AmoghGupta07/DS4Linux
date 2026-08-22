@@ -19,6 +19,47 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+/// RGB lightbar color, 0-255 per channel -- matches DS4's native color
+/// range directly (no scaling needed when writing to the output report).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LightbarColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl Default for LightbarColor {
+    fn default() -> Self {
+        // Blue: DS4's own factory-default color when no profile has set
+        // one, so a fresh install "looks like a normal DS4" rather than
+        // an unexpected color.
+        LightbarColor { red: 125, green: 0, blue: 255 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Ds4FeedbackConfig {
+    pub lightbar: LightbarColor,
+    /// Whether to send a brief rumble pulse when this profile is loaded,
+    /// confirming to the person (without needing to look at the screen)
+    /// that the daemon connected and picked up the right profile.
+    #[serde(default = "default_true")]
+    pub rumble_on_load: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Ds4FeedbackConfig {
+    fn default() -> Self {
+        Ds4FeedbackConfig {
+            lightbar: LightbarColor::default(),
+            rumble_on_load: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     /// Display name, also used to derive the filename. Not read from the
@@ -28,6 +69,12 @@ pub struct Profile {
     pub name: String,
     pub gyro: GyroStickConfig,
     pub touchpad: TouchpadConfig,
+    /// `#[serde(default)]` so profile files saved before this milestone
+    /// (no `[feedback]` section) still parse correctly instead of
+    /// failing to load -- missing field falls back to
+    /// Ds4FeedbackConfig::default() rather than erroring.
+    #[serde(default)]
+    pub feedback: Ds4FeedbackConfig,
 }
 
 impl Default for Profile {
@@ -36,6 +83,7 @@ impl Default for Profile {
             name: "Default".to_string(),
             gyro: GyroStickConfig::default(),
             touchpad: TouchpadConfig::default(),
+            feedback: Ds4FeedbackConfig::default(),
         }
     }
 }
