@@ -88,6 +88,9 @@ fn main() {
     let mut buf = [0u8; 128]; // oversized vs the 78-byte report, headroom for safety
     let mut total_reads = 0u64;
     let mut crc_failures = 0u64;
+    let mut valid_reports = 0u64;
+    let rate_check_start = std::time::Instant::now();
+    let mut last_rate_print = std::time::Instant::now();
 
     loop {
         match device.read_timeout(&mut buf, 100) {
@@ -136,6 +139,18 @@ fn main() {
 
                 let state = ds4l::ds4_bt::parse_report_bt(report);
                 let gyro = calibrated_gyro_deg_s(&state, &cal);
+                valid_reports += 1;
+
+                if last_rate_print.elapsed().as_secs_f64() >= 2.0 {
+                    let elapsed = rate_check_start.elapsed().as_secs_f64();
+                    let hz = valid_reports as f64 / elapsed;
+                    eprintln!(
+                        "\n[rate] {valid_reports} valid reports in {elapsed:.1}s = {hz:.1} Hz \
+                         (USB is normally ~250Hz; if this is stuck near ~20Hz, that's a known \
+                         DS4-over-BlueZ kernel-level report-rate cap, not a bug in this program)"
+                    );
+                    last_rate_print = std::time::Instant::now();
+                }
 
                 print!(
                     "\rLX:{:3} LY:{:3} RX:{:3} RY:{:3} dpad:{} △:{} ○:{} ×:{} □:{} \

@@ -30,7 +30,7 @@
 //! parsed values, the same way the touchpad offset bug was actually
 //! caught and fixed.
 
-use crate::ds4_input::{GyroCalibration, PadState, TouchFinger};
+use crate::ds4_input::{GyroCalibration, OutputReport, PadState, TouchFinger};
 use hidapi::HidDevice;
 
 pub const DS4_INPUT_REPORT_BT_ID: u8 = 0x11;
@@ -256,4 +256,82 @@ pub fn read_bt_report(device: &HidDevice, buf: &mut [u8]) -> Result<Option<PadSt
 /// values the same way the original USB calibration bug was caught.
 pub fn read_calibration_bt(device: &HidDevice) -> Result<GyroCalibration, String> {
     crate::ds4_input::read_calibration(device)
+}
+
+/// Sends a Bluetooth output report (0x11) to set rumble/lightbar, reusing
+/// the same OutputReport struct USB uses so callers don't need a
+/// transport-specific type.
+///
+/// CORRECTED against a real, hardware-confirmed working reference: a
+/// Noctalia shell plugin (ds4-color) whose Lua source was provided
+/// directly and diffed byte-for-byte against this function. Three real
+/// bugs were found and fixed:
+///
+/// 1. CRC seed byte is 0xA2, not 0xA1. Input reports use 0xA1 (HID
+///    transaction type DATA|INPUT), confirmed correct earlier against
+///    real captured input bytes -- but OUTPUT reports use 0xA2
+///    (DATA|OUTPUT), a different transaction type byte. Using the wrong
+///    seed produces a CRC the controller's firmware rejects, which
+///    explains the observed symptom: LED briefly shows the requested
+///    color then reverts to the firmware's own fault-indicator red.
+/// 2. The CRC must be negated (~) after hashing -- opposite of what was
+///    correct for input report validation. Confirmed by reproducing the
+///    reference's exact CRC computation in Python and matching its
+///    output.
+/// 3. Byte 1 is a fixed 0xC4 (labelled DS4_BT_HW_CONTROL in the
+///    reference), not the 0x80 poll-rate-unlock byte I'd carried over
+///    from a different context (input report handling). Field offsets
+///    also corrected: valid_flag0 at byte 3, lightbar RGB at bytes 8/9/10
+///    (not 6/8/9/10 as before).
+///
+/// Rumble motor byte positions are NOT independently confirmed by this
+/// reference (it only ever sets LED, never rumble) -- kept at a
+/// best-guess position consistent with the corrected offsets, but treat
+/// rumble-over-BT with more caution than the now-confirmed LED path
+/// until tested.
+pub fn send_output_report_bt(device: &HidDevice, report: &OutputReport) -> Result<(), String> {
+    let mut buf = [0u8; 78]; // matches DS4_INPUT_REPORT_BT_SIZE / the reference's DS4_BT_REPORT_LEN
+    buf[0] = 0x11; // BT output report ID
+    buf[1] = 0xC4; // fixed header byte, confirmed via working reference (was wrongly 0x80)
+    buf[2] = 0x00;
+
+    let mut valid_flag0: u8 = 0;
+    if report.set_rumble {
+        valid_flag0 |= 0x01;
+    }
+    if report.set_led {
+        valid_flag0 |= 0x02; // confirmed: DS4_OUTPUT_VALID_FLAG0_LED = 0x02
+    }
+    buf[3] = valid_flag0;
+
+    // Rumble position: unconfirmed by the reference (LED-only), kept
+    // adjacent to the confirmed valid_flag0 offset as a reasonable
+    // extrapolation consistent with USB's own field ordering
+    // (rumble immediately follows valid_flag0/reserved there too).
+    buf[6] = report.rumble_weak;
+    buf[7] = report.rumble_strong;
+
+    // Confirmed lightbar offsets from the reference: R=8, G=9, B=10.
+    buf[8] = report.led_red;
+    buf[9] = report.led_green;
+    buf[10] = report.led_blue;
+    // led_blink_on/off intentionally not set -- the reference doesn't
+    // use them either, and their exact confirmed offset is unknown.
+
+    // CRC32: seed with 0xA2 (not 0xA1 -- see doc comment above), hash
+    // bytes [0..74), then NEGATE the result (opposite of input report
+    // validation) before storing little-endian in the last 4 bytes.
+    // Verified by reproducing this exact computation in Python against
+    // the working reference's algorithm and confirming matching output.
+    let payload_end = buf.len() - 4;
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&[0xA2u8]);
+    hasher.update(&buf[..payload_end]);
+    let crc = !hasher.finalize();
+    buf[payload_end..].copy_from_slice(&crc.to_le_bytes());
+
+    device
+        .write(&buf)
+        .map_err(|e| format!("failed to write BT output report: {e}"))?;
+    Ok(())
 }

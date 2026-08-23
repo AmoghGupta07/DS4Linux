@@ -194,7 +194,7 @@ pub struct KbmFrame {
 /// Computes this frame's full "held" set from the current pad state and
 /// config. Digital stick directions and triggers are threshold-gated;
 /// buttons map directly from PadState's existing bools.
-pub fn compute_frame(state: &PadState, cfg: &KbmConfig, kbm_state: &mut KbmState) -> KbmFrame {
+pub fn compute_frame(state: &PadState, cfg: &KbmConfig, _kbm_state: &mut KbmState) -> KbmFrame {
     let mut held = std::collections::HashSet::new();
     let mut add = |target: KbmTarget| {
         if let Some(pk) = target.to_pressed_key() {
