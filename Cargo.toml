@@ -9,6 +9,7 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "6"
+crc32fast = "1.5"
 
 [lib]
 name = "ds4l"
@@ -37,3 +38,7 @@ path = "src/bin/touchpad_test.rs"
 [[bin]]
 name = "ds4l_daemon"
 path = "src/bin/ds4l_daemon.rs"
+
+[[bin]]
+name = "bluetooth_test"
+path = "src/bin/bluetooth_test.rs"
