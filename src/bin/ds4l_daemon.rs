@@ -16,8 +16,14 @@
 //
 // Profile file lives at ~/.config/ds4l/profiles/<name>.toml and is plain,
 // hand-editable TOML -- edit it, restart the daemon, changes take effect.
-// (Live-reload without restart is a natural follow-up once this is
-// confirmed working, not included this milestone.)
+//
+// Live profile switching WITHOUT a restart is now also available via a
+// local control socket (see src/ipc.rs) -- ds4l_gui's tray icon (or any
+// client speaking that plain-text protocol) can tell an already-running
+// daemon to load a different profile on the fly. This is new,
+// NOT YET verified against a live GUI/daemon pair the way the rest of
+// this project was checked against real hardware before being trusted
+// -- see ipc.rs's doc comment.
 
 use ds4l::ds4_bt::{self, trigger_full_report_mode};
 use ds4l::ds4_input::{
@@ -25,12 +31,14 @@ use ds4l::ds4_input::{
     PadState, SONY_VID,
 };
 use ds4l::gyro_stick::{self, GyroStickState};
+use ds4l::ipc;
 use ds4l::kbm::{self, KbmState, PressedKey};
-use ds4l::profile::{self, OutputMode, Profile};
+use ds4l::profile::{self, Ds4FeedbackConfig, OutputMode, Profile};
 use ds4l::touchpad::{self, ClickButton, MouseAction, TouchpadMode, TouchpadMouseState};
 use ds4l::uinput_ds4::{self, VirtualDs4};
 use ds4l::uinput_mouse::{self, VirtualMouse};
 use hidapi::{HidApi, HidDevice};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Which transport the daemon connected over. Determines how reports are
@@ -38,9 +46,24 @@ use std::time::Duration;
 /// -- everything downstream of a parsed PadState is identical regardless
 /// of connection type, which is exactly why ds4_bt.rs was built to
 /// produce the same PadState USB parsing does.
+///
+/// `Clone, Copy`: needed so a live profile switch (apply_profile_switch)
+/// can be handed the connection type by value without fighting the
+/// borrow checker over a `&Connection` that's also being matched on in
+/// the main loop at the same time.
+#[derive(Clone, Copy)]
 enum Connection {
     Usb,
     Bluetooth,
+}
+
+impl Connection {
+    fn label(self) -> &'static str {
+        match self {
+            Connection::Usb => "USB",
+            Connection::Bluetooth => "Bluetooth",
+        }
+    }
 }
 
 /// DS4 v2's Bluetooth PID -- confirmed identical to USB's (0x09CC) when
@@ -78,7 +101,10 @@ const DS4_V2_BT_PID: u16 = 0x09CC;
 /// Usage 0x09 0x05). Note: usage_page/usage are NOT available via the
 /// Linux libusb hidapi backend per hidapi's own docs -- this project
 /// uses the default hidraw backend, where they are available.
-fn connect(api: &HidApi, force_bluetooth: bool) -> (HidDevice, Connection, ds4l::ds4_input::GyroCalibration) {
+fn connect(
+    api: &HidApi,
+    force_bluetooth: bool,
+) -> (HidDevice, Connection, ds4l::ds4_input::GyroCalibration, std::path::PathBuf) {
     const USAGE_PAGE_GENERIC_DESKTOP: u16 = 0x01;
     const USAGE_GAME_PAD: u16 = 0x05;
 
@@ -104,6 +130,7 @@ fn connect(api: &HidApi, force_bluetooth: bool) -> (HidDevice, Connection, ds4l:
 
     if !force_bluetooth {
         if let Some(info) = usb_info {
+            let hidraw_path = std::path::PathBuf::from(info.path().to_string_lossy().to_string());
             if let Ok(device) = info.open_device(api) {
                 println!("Found DS4 v2 on USB bus, connecting...");
                 if let Err(e) = device.set_blocking_mode(false) {
@@ -113,7 +140,7 @@ fn connect(api: &HidApi, force_bluetooth: bool) -> (HidDevice, Connection, ds4l:
                     eprintln!("Warning: USB calibration read failed ({e}) -- gyro will be uncalibrated.");
                     ds4l::ds4_input::GyroCalibration::identity()
                 });
-                return (device, Connection::Usb, cal);
+                return (device, Connection::Usb, cal, hidraw_path);
             }
         }
         println!("No USB DS4 found, trying Bluetooth...");
@@ -128,6 +155,7 @@ fn connect(api: &HidApi, force_bluetooth: bool) -> (HidDevice, Connection, ds4l:
         std::process::exit(1);
     });
 
+    let hidraw_path = std::path::PathBuf::from(info.path().to_string_lossy().to_string());
     let device = info.open_device(api).unwrap_or_else(|e| {
         eprintln!("Found a Bluetooth DS4 but failed to open it: {e}");
         std::process::exit(1);
@@ -146,7 +174,7 @@ fn connect(api: &HidApi, force_bluetooth: bool) -> (HidDevice, Connection, ds4l:
         ds4l::ds4_input::GyroCalibration::identity()
     });
 
-    (device, Connection::Bluetooth, cal)
+    (device, Connection::Bluetooth, cal, hidraw_path)
 }
 
 fn parse_args() -> (String, bool, bool) {
@@ -260,11 +288,224 @@ fn emit_pressed_key(mouse: &mut VirtualMouse, key: PressedKey, pressed: bool) ->
     }
 }
 
+/// Creates the virtual device(s) a profile needs: a VirtualDs4 for
+/// Gamepad output mode, a VirtualMouse for Kbm mode or for Gamepad mode
+/// with touchpad MouseRemap, both, or neither. Returns an error instead
+/// of exiting the process, unlike an earlier inline version of this
+/// logic that called `std::process::exit(1)` directly on failure --
+/// that was correct for the ORIGINAL startup-only call site (nothing
+/// useful to fall back to if the very first device creation fails), but
+/// would be wrong here now that this same logic also runs mid-session
+/// on a live profile switch, where a failure should be reported back to
+/// the caller (ds4l_gui) while the daemon keeps running its current,
+/// still-working profile -- never killed by a switch attempt gone wrong.
+fn try_create_virtual_devices(
+    profile: &Profile,
+) -> Result<(Option<VirtualDs4>, Option<VirtualMouse>), String> {
+    let virtual_pad = if profile.output_mode == OutputMode::Gamepad {
+        Some(VirtualDs4::create().map_err(|e| format!("failed to create virtual DS4: {e}"))?)
+    } else {
+        None
+    };
+
+    let needs_mouse_device = profile.output_mode == OutputMode::Kbm
+        || (profile.output_mode == OutputMode::Gamepad
+            && profile.touchpad.mode == TouchpadMode::MouseRemap);
+    let virtual_mouse = if needs_mouse_device {
+        let extra_keys: Vec<u16> = if profile.output_mode == OutputMode::Kbm {
+            collect_mapped_keys(&profile.kbm)
+        } else {
+            Vec::new()
+        };
+        Some(
+            VirtualMouse::create(&extra_keys)
+                .map_err(|e| format!("failed to create virtual mouse: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    Ok((virtual_pad, virtual_mouse))
+}
+
+/// Sends the profile's lightbar color and, if enabled, a brief rumble
+/// pulse. Factored out of main() so both the initial connect AND a live
+/// profile switch (ds4l_gui) reuse the exact same, already hardware-
+/// verified-and-bugfixed logic rather than risking the two paths drift
+/// apart. See the BUGFIX note below -- unchanged from the original,
+/// this is load-bearing, not decorative.
+fn apply_feedback(device: &HidDevice, connection: Connection, feedback: &Ds4FeedbackConfig) {
+    let lb = feedback.lightbar;
+
+    // BUGFIX: every output report below carries the current lightbar
+    // color, even reports whose purpose is only rumble. Root cause:
+    // this DS4's firmware appears to apply the LED RGB bytes
+    // unconditionally, regardless of whether the LED bit in valid_flag0
+    // is set -- a rumble-only report built with led fields left at 0
+    // (the natural way to write "don't touch the LED") silently blanks
+    // the lightbar a moment after it was set. Matches a documented
+    // kernel quirk (a 2024 hid-playstation patch: "some 3rd party
+    // gamepads expect updates to rumble and lightbar together, and
+    // setting one may cancel the other"). Fix: always resend the
+    // intended color alongside rumble.
+    let led_report = OutputReport {
+        led_red: lb.red,
+        led_green: lb.green,
+        led_blue: lb.blue,
+        set_led: true,
+        ..Default::default()
+    };
+    let led_result = match connection {
+        Connection::Usb => send_output_report(device, &led_report),
+        Connection::Bluetooth => ds4_bt::send_output_report_bt(device, &led_report),
+    };
+    if let Err(e) = led_result {
+        eprintln!("Warning: failed to set lightbar color: {e}");
+    }
+
+    if feedback.rumble_on_load {
+        let pulse_on = OutputReport {
+            rumble_weak: 150,
+            rumble_strong: 150,
+            set_rumble: true,
+            led_red: lb.red,
+            led_green: lb.green,
+            led_blue: lb.blue,
+            set_led: true,
+            ..Default::default()
+        };
+        let pulse_on_result = match connection {
+            Connection::Usb => send_output_report(device, &pulse_on),
+            Connection::Bluetooth => ds4_bt::send_output_report_bt(device, &pulse_on),
+        };
+        if let Err(e) = pulse_on_result {
+            eprintln!("Warning: failed to start rumble pulse: {e}");
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let pulse_off = OutputReport {
+            rumble_weak: 0,
+            rumble_strong: 0,
+            set_rumble: true,
+            led_red: lb.red,
+            led_green: lb.green,
+            led_blue: lb.blue,
+            set_led: true,
+            ..Default::default()
+        };
+        let pulse_off_result = match connection {
+            Connection::Usb => send_output_report(device, &pulse_off),
+            Connection::Bluetooth => ds4_bt::send_output_report_bt(device, &pulse_off),
+        };
+        if let Err(e) = pulse_off_result {
+            eprintln!("Warning: failed to stop rumble pulse: {e}");
+        }
+    }
+}
+
+/// Handles one SWITCH_PROFILE request relayed from ipc.rs's control
+/// socket: loads the named profile from disk, and only if EVERYTHING
+/// needed to run it succeeds does it replace the live profile, virtual
+/// devices, and per-session state -- a failed switch must never leave
+/// the daemon half-migrated between two profiles.
+///
+/// KNOWN LIMITATION (deliberate, documented rather than silently
+/// accepted): this always tears down and recreates BOTH virtual devices
+/// on every switch, even when the new profile needs exactly the same
+/// device shape as the old one (e.g. switching between two Gamepad-mode
+/// profiles that only differ in gyro sensitivity). The alternative --
+/// diffing whether the new profile's device requirements, and for Kbm
+/// mode specifically its exact registered key set, actually differ from
+/// what's currently created -- adds real complexity for a case
+/// (profile switching) that's a deliberate, infrequent user action, not
+/// a hot path. Recreating unconditionally is trivially correct instead:
+/// VirtualDs4/VirtualMouse's existing Drop impls already destroy their
+/// uinput nodes cleanly, so `*virtual_pad = new_pad` below just works.
+/// Cost: this makes every switch take ~500-700ms (VirtualDs4::create's
+/// 500ms + VirtualMouse::create's 200ms settle sleeps, when both are
+/// needed) plus another ~250ms if the new profile has rumble_on_load
+/// enabled -- up to ~1s, during which the main loop (and therefore
+/// input processing) is blocked. Bounded and expected for a deliberate
+/// switch, not a hang; ipc.rs's SWITCH_PROFILE reply wait is sized with
+/// that in mind. Revisit if this ever feels too slow in practice.
+#[allow(clippy::too_many_arguments)]
+fn apply_profile_switch(
+    name: &str,
+    profile: &mut Profile,
+    virtual_pad: &mut Option<VirtualDs4>,
+    virtual_mouse: &mut Option<VirtualMouse>,
+    gyro_state: &mut GyroStickState,
+    touchpad_mouse_state: &mut TouchpadMouseState,
+    kbm_state: &mut KbmState,
+    hidden_controller: &Arc<Mutex<Option<ds4l::hide_controller::HiddenController>>>,
+    device: &HidDevice,
+    connection: Connection,
+    hidraw_path: &std::path::Path,
+    send_feedback: bool,
+    status: &Arc<Mutex<ipc::StatusSnapshot>>,
+) -> Result<(), String> {
+    let new_profile =
+        profile::load(name).map_err(|e| format!("failed to load profile \"{name}\": {e}"))?;
+
+    // Build the new virtual devices FIRST -- this is the step in this
+    // function most likely to fail (permissions, uinput resource
+    // limits), and doing it before touching any existing state means a
+    // failure here leaves the old profile/devices completely untouched.
+    let (new_pad, new_mouse) = try_create_virtual_devices(&new_profile)?;
+
+    // Reconcile controller-hiding only if the setting actually changed,
+    // so switching between two profiles that both hide the controller
+    // doesn't needlessly toggle permissions off and back on.
+    if new_profile.hide_real_controller != profile.hide_real_controller {
+        if new_profile.hide_real_controller {
+            match ds4l::hide_controller::HiddenController::hide(hidraw_path) {
+                Ok(guard) => *hidden_controller.lock().unwrap() = Some(guard),
+                Err(e) => eprintln!(
+                    "Warning: switched to profile \"{name}\" but failed to hide the real \
+                     controller: {e}"
+                ),
+            }
+        } else {
+            // Dropping the guard runs HiddenController::restore().
+            *hidden_controller.lock().unwrap() = None;
+        }
+    }
+
+    // Nothing past this point can fail -- safe to commit the swap. The
+    // OLD virtual_pad/virtual_mouse Drop here (destroying their uinput
+    // nodes) the moment they're overwritten.
+    *virtual_pad = new_pad;
+    *virtual_mouse = new_mouse;
+    *profile = new_profile;
+
+    // Fresh per-session state for the new profile: gyro smoothing/
+    // toggle-latch, touchpad delta baseline, and kbm's held-key set are
+    // all meaningless -- or actively wrong, e.g. a stale toggle_active
+    // silently reactivating gyro under a different profile's totally
+    // different sensitivity -- if carried over from the old profile.
+    *gyro_state = GyroStickState::default();
+    *touchpad_mouse_state = TouchpadMouseState::default();
+    *kbm_state = KbmState::default();
+
+    if send_feedback {
+        apply_feedback(device, connection, &profile.feedback);
+    }
+
+    *status.lock().unwrap() = ipc::StatusSnapshot {
+        profile_name: profile.name.clone(),
+        output_mode: format!("{:?}", profile.output_mode),
+        connection: connection.label().to_string(),
+        hidden: hidden_controller.lock().unwrap().is_some(),
+    };
+
+    println!("\nSwitched to profile \"{}\" via control socket.", profile.name);
+    Ok(())
+}
+
 fn main() {
     let (profile_name, force_bluetooth, allow_bt_feedback) = parse_args();
 
     println!("Loading profile \"{profile_name}\"...");
-    let profile: Profile = profile::load(&profile_name).unwrap_or_else(|e| {
+    let mut profile: Profile = profile::load(&profile_name).unwrap_or_else(|e| {
         eprintln!(
             "Failed to load profile \"{profile_name}\": {e}\n\
              Falling back to built-in defaults for this run (not saved)."
@@ -280,8 +521,8 @@ fn main() {
     );
     if let Ok(path) = profile::profiles_dir() {
         println!(
-            "(Edit ~/.config/ds4l/profiles/{profile_name}.toml directly and restart to change \
-             settings -- full path: {})",
+            "(Edit ~/.config/ds4l/profiles/{profile_name}.toml directly and restart, or use \
+             ds4l_gui to edit and hot-switch profiles live -- full path: {})",
             path.join(format!("{profile_name}.toml")).display()
         );
     }
@@ -289,88 +530,116 @@ fn main() {
     let api = HidApi::new().expect("failed to init hidapi (is hidraw accessible? check udev rules)");
 
     println!("Connecting to DS4 v2...");
-    let (device, connection, cal) = connect(&api, force_bluetooth);
+    let (device, connection, cal, hidraw_path) = connect(&api, force_bluetooth);
     println!("DS4 connected, calibration loaded.");
 
-    // LED/rumble now implemented for both USB and Bluetooth. BT support
-    // is NEWLY ADDED and carries a documented real risk (see
-    // ds4_bt::send_output_report_bt's doc comment): a malformed BT
-    // output report has been reported to silently stop the controller
-    // from streaming full input reports until reconnected -- not just
-    // "rumble won't work," potentially "input breaks too." Given that,
-    // BT LED/rumble is gated behind --bt-feedback rather than firing
-    // automatically on every BT connection, so a bad first test doesn't
-    // silently break your input mid-session without you expecting it.
+    // Controller hiding: restricts the real controller's device nodes
+    // from other processes (Steam, games) while this daemon runs,
+    // restoring original permissions on exit -- including Ctrl+C AND
+    // `systemctl stop`/plain `kill` (SIGTERM), via the ctrlc handler
+    // below. Opt-in per profile (hide_real_controller), off by default.
+    //
+    // The ctrlc handler and the HiddenController guard both need to run
+    // restore() before exit -- Drop alone won't fire on an unhandled
+    // signal, since the default Rust behavior for SIGINT/SIGTERM/SIGHUP
+    // terminates the process without unwinding the stack. We hold the
+    // guard in an Arc<Mutex<Option<_>>> shared between main() and the
+    // signal handler so either path (normal Drop at end of main, or the
+    // handler firing on a signal) can trigger restoration exactly once.
+    //
+    // IMPORTANT: the `ctrlc` crate only registers a handler for SIGINT
+    // by default -- SIGTERM (what `systemctl stop` and a plain `kill`
+    // send) and SIGHUP would otherwise still terminate the process
+    // immediately, un-caught, leaving the controller hidden. Cargo.toml
+    // enables ctrlc's `termination` feature specifically so the same
+    // set_handler() call below covers SIGINT, SIGTERM, and SIGHUP --
+    // don't drop that feature flag without re-adding equivalent
+    // handling (e.g. via `signal-hook`), or this silently regresses.
+    let hidden_controller: Arc<Mutex<Option<ds4l::hide_controller::HiddenController>>> =
+        Arc::new(Mutex::new(None));
+
+    if profile.hide_real_controller {
+        match ds4l::hide_controller::HiddenController::hide(&hidraw_path) {
+            Ok(guard) => {
+                *hidden_controller.lock().unwrap() = Some(guard);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to hide real controller: {e}\n\
+                     Continuing without hiding -- other processes may still see the real controller."
+                );
+            }
+        }
+    }
+
+    // Control socket: lets ds4l_gui (or anything else speaking the plain
+    // text protocol documented in ipc.rs) query status and hot-switch
+    // profiles on this already-running daemon without a restart. A
+    // failure to bind here is a WARNING, not fatal -- the daemon is
+    // still fully usable standalone, just not remotely controllable
+    // this run (e.g. a stale-socket/permission problem on the runtime
+    // dir, or another daemon instance already holding it).
+    let status = Arc::new(Mutex::new(ipc::StatusSnapshot {
+        profile_name: profile.name.clone(),
+        output_mode: format!("{:?}", profile.output_mode),
+        connection: connection.label().to_string(),
+        hidden: hidden_controller.lock().unwrap().is_some(),
+    }));
+    let control_rx = match ipc::start(status.clone()) {
+        Ok(rx) => {
+            println!("Control socket listening at {}", ipc::socket_path().display());
+            Some(rx)
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: could not start control socket ({e}) -- ds4l_gui profile switching \
+                 will not work this run; the daemon itself is otherwise unaffected."
+            );
+            None
+        }
+    };
+
+    {
+        let hidden_controller_for_handler = hidden_controller.clone();
+        let socket_path_for_handler = ipc::socket_path();
+        if let Err(e) = ctrlc::set_handler(move || {
+            // Explicitly drop the guard here (rather than relying on
+            // process exit to run Drop) so permissions are restored
+            // before the process actually terminates. Fires for
+            // SIGINT, SIGTERM, or SIGHUP -- see the `termination`
+            // feature note on the ctrlc dependency in Cargo.toml.
+            *hidden_controller_for_handler.lock().unwrap() = None;
+            // Also clean up the control socket file so a subsequent
+            // restart's stale-socket check in ipc::start() has one less
+            // thing to reason about -- best-effort, not required for
+            // correctness (start() already handles a leftover file from
+            // an unclean exit like kill -9 on its own).
+            let _ = std::fs::remove_file(&socket_path_for_handler);
+            std::process::exit(0);
+        }) {
+            eprintln!(
+                "Warning: failed to install signal handler ({e}) -- if the real controller is \
+                 hidden, permissions will only be restored on normal exit, not Ctrl+C/SIGTERM/ \
+                 SIGHUP. Restore manually with chmod if the controller seems inaccessible after \
+                 a forced quit."
+            );
+        }
+    }
+
+    // LED/rumble implemented for both USB and Bluetooth; BT support
+    // carries a documented real risk (see ds4_bt::send_output_report_bt's
+    // doc comment): a malformed BT output report has been reported to
+    // silently stop the controller from streaming full input reports
+    // until reconnected -- not just "rumble won't work," potentially
+    // "input breaks too." Given that, BT LED/rumble is gated behind
+    // --bt-feedback rather than firing automatically on every BT
+    // connection, so a bad first test doesn't silently break your input
+    // mid-session without you expecting it. This flag is a daemon-
+    // startup setting (not per-profile), so it applies the same way to
+    // every profile switch for the life of this process.
     let send_feedback = matches!(connection, Connection::Usb) || allow_bt_feedback;
     if send_feedback {
-        let lb = profile.feedback.lightbar;
-
-        // BUGFIX: every output report below now carries the current
-        // lightbar color, even reports whose purpose is only rumble.
-        // Root cause: this DS4's firmware appears to apply the LED RGB
-        // bytes unconditionally, regardless of whether the LED bit in
-        // valid_flag0 is set. The earlier version built the rumble pulse
-        // reports from OutputReport::default() (led_red/green/blue = 0,
-        // set_led = false), which correctly SIGNALED "don't touch the
-        // LED" via the flag, but the RGB=0 bytes still got applied
-        // because the flag was apparently ignored -- so the rumble-only
-        // report blanked the lightbar a moment after it was set. This
-        // matches a documented kernel quirk (a 2024 hid-playstation
-        // patch: "some 3rd party gamepads expect updates to rumble and
-        // lightbar together, and setting one may cancel the other").
-        // Fix: always resend the intended color alongside rumble.
-        let led_report = OutputReport {
-            led_red: lb.red,
-            led_green: lb.green,
-            led_blue: lb.blue,
-            set_led: true,
-            ..Default::default()
-        };
-        let led_result = match connection {
-            Connection::Usb => send_output_report(&device, &led_report),
-            Connection::Bluetooth => ds4_bt::send_output_report_bt(&device, &led_report),
-        };
-        if let Err(e) = led_result {
-            eprintln!("Warning: failed to set lightbar color: {e}");
-        }
-
-        if profile.feedback.rumble_on_load {
-            let pulse_on = OutputReport {
-                rumble_weak: 150,
-                rumble_strong: 150,
-                set_rumble: true,
-                led_red: lb.red,
-                led_green: lb.green,
-                led_blue: lb.blue,
-                set_led: true,
-                ..Default::default()
-            };
-            let pulse_on_result = match connection {
-                Connection::Usb => send_output_report(&device, &pulse_on),
-                Connection::Bluetooth => ds4_bt::send_output_report_bt(&device, &pulse_on),
-            };
-            if let Err(e) = pulse_on_result {
-                eprintln!("Warning: failed to start rumble pulse: {e}");
-            }
-            std::thread::sleep(Duration::from_millis(250));
-            let pulse_off = OutputReport {
-                rumble_weak: 0,
-                rumble_strong: 0,
-                set_rumble: true,
-                led_red: lb.red,
-                led_green: lb.green,
-                led_blue: lb.blue,
-                set_led: true,
-                ..Default::default()
-            };
-            let pulse_off_result = match connection {
-                Connection::Usb => send_output_report(&device, &pulse_off),
-                Connection::Bluetooth => ds4_bt::send_output_report_bt(&device, &pulse_off),
-            };
-            if let Err(e) = pulse_off_result {
-                eprintln!("Warning: failed to stop rumble pulse: {e}");
-            }
-        }
+        apply_feedback(&device, connection, &profile.feedback);
     } else {
         println!(
             "(LED/rumble on load skipped over Bluetooth -- pass --bt-feedback to enable; \
@@ -381,36 +650,14 @@ fn main() {
     // Device creation branches on output_mode: Gamepad mode creates the
     // virtual DS4 (plus an optional virtual mouse for touchpad remap);
     // Kbm mode creates only the combined keyboard+mouse device, since
-    // there's no virtual gamepad to drive in that mode.
-    let mut virtual_pad = if profile.output_mode == OutputMode::Gamepad {
-        Some(VirtualDs4::create().unwrap_or_else(|e| {
-            eprintln!("Failed to create virtual DS4: {e}\nCheck /dev/uinput permissions.");
+    // there's no virtual gamepad to drive in that mode. Shared with the
+    // live-switch path (apply_profile_switch) via try_create_virtual_devices
+    // so both use identical logic.
+    let (mut virtual_pad, mut virtual_mouse) =
+        try_create_virtual_devices(&profile).unwrap_or_else(|e| {
+            eprintln!("{e}\nCheck /dev/uinput permissions.");
             std::process::exit(1);
-        }))
-    } else {
-        None
-    };
-
-    let needs_mouse_device = profile.output_mode == OutputMode::Kbm
-        || (profile.output_mode == OutputMode::Gamepad
-            && profile.touchpad.mode == TouchpadMode::MouseRemap);
-    let mut virtual_mouse = if needs_mouse_device {
-        // KBM mode needs every key code its mapping actually uses
-        // registered up front; touchpad-only MouseRemap mode (Gamepad
-        // output) doesn't need any keyboard keys, just the base mouse
-        // buttons uinput_mouse::create always registers.
-        let extra_keys: Vec<u16> = if profile.output_mode == OutputMode::Kbm {
-            collect_mapped_keys(&profile.kbm)
-        } else {
-            Vec::new()
-        };
-        Some(VirtualMouse::create(&extra_keys).unwrap_or_else(|e| {
-            eprintln!("Failed to create virtual mouse: {e}\nCheck /dev/uinput permissions.");
-            std::process::exit(1);
-        }))
-    } else {
-        None
-    };
+        });
     println!("Virtual device(s) created. Running with profile \"{}\".", profile.name);
     println!("Ctrl+C to quit.\n");
 
@@ -420,6 +667,44 @@ fn main() {
 
     let mut buf = [0u8; 128]; // sized for BT's 78-byte report; USB's 64-byte report fits too
     loop {
+        // Non-blocking poll for control-socket commands (profile
+        // switches from ds4l_gui), once per iteration -- see ipc.rs for
+        // the protocol. device.read_timeout() below already blocks up
+        // to 100ms per iteration, so a requested switch takes effect
+        // within ~100ms: plenty responsive for a deliberate user
+        // action, and try_recv() never blocks, so this adds no latency
+        // to the hot input-read path on iterations with no command
+        // pending (the overwhelming majority of them).
+        if let Some(rx) = control_rx.as_ref() {
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    ipc::PendingCommand::SwitchProfile { name, reply } => {
+                        let result = apply_profile_switch(
+                            &name,
+                            &mut profile,
+                            &mut virtual_pad,
+                            &mut virtual_mouse,
+                            &mut gyro_state,
+                            &mut touchpad_mouse_state,
+                            &mut kbm_state,
+                            &hidden_controller,
+                            &device,
+                            connection,
+                            &hidraw_path,
+                            send_feedback,
+                            &status,
+                        );
+                        // Ignore a send failure here: it only means the
+                        // requesting client already gave up/disconnected
+                        // (e.g. hit ipc.rs's own 5s timeout) -- the
+                        // switch itself still applied successfully to
+                        // the daemon either way.
+                        let _ = reply.send(result);
+                    }
+                }
+            }
+        }
+
         let maybe_state: Option<PadState> = match connection {
             Connection::Usb => match device.read_timeout(&mut buf, 100) {
                 Ok(len) if len >= 25 && buf[0] == 0x01 => Some(parse_report(&buf)),

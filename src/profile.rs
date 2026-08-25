@@ -102,6 +102,14 @@ pub struct Profile {
     pub output_mode: OutputMode,
     #[serde(default)]
     pub kbm: KbmConfig,
+    /// Whether the real controller's device nodes should be hidden from
+    /// other processes while the daemon runs (see hide_controller.rs).
+    /// Defaults to false: hiding is opt-in, not automatic, since it's a
+    /// permission-changing action on system device nodes and a person
+    /// should choose it deliberately per profile rather than have it
+    /// silently enabled by default.
+    #[serde(default)]
+    pub hide_real_controller: bool,
 }
 
 impl Default for Profile {
@@ -113,6 +121,7 @@ impl Default for Profile {
             feedback: Ds4FeedbackConfig::default(),
             output_mode: OutputMode::default(),
             kbm: KbmConfig::default(),
+            hide_real_controller: false,
         }
     }
 }

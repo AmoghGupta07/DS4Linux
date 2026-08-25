@@ -10,6 +10,35 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "6"
 crc32fast = "1.5"
+ctrlc = { version = "3.5", features = ["termination"] }
+
+# GUI-only deps for the ds4l_gui binary (profile editor + tray icon),
+# gated behind the `gui` feature so the core daemon/library and every
+# milestone test binary keep building without needing GTK4 dev headers/
+# pkg-config or a D-Bus session at all -- nothing else in this crate has
+# any GUI surface, so nothing else should pick up a GUI-toolkit system
+# dependency just because ds4l_gui exists alongside it.
+#
+# ksni's "blocking" feature gives a synchronous API on top of its
+# default backend (no tokio/async-io runtime setup needed in ds4l_gui's
+# own code), matching this project's existing preference for plain
+# blocking I/O/threads over async elsewhere (hidapi reads, the ipc.rs
+# control socket, etc). See the exact feature line below for why
+# default features must stay ON here.
+# ksni's "blocking" feature layers a synchronous API ON TOP OF its
+# default async-io backend (zbus's lightweight internal executor, not
+# something the caller sets up) -- it does NOT replace that backend, so
+# it must be added alongside the defaults, not with default-features =
+# false. (First attempt at this line incorrectly disabled default
+# features, which stripped away the async-io backend zbus needs and
+# left neither "async-io" nor "tokio" enabled -- a hard compile_error!
+# in zbus itself. Confirmed against ksni's own crates.io/docs.rs usage
+# example before writing this line the second time, not guessed again.)
+gtk4 = { version = "0.9", optional = true }
+ksni = { version = "0.3", features = ["blocking"], optional = true }
+
+[features]
+gui = ["dep:gtk4", "dep:ksni"]
 
 [lib]
 name = "ds4l"
@@ -42,3 +71,8 @@ path = "src/bin/ds4l_daemon.rs"
 [[bin]]
 name = "bluetooth_test"
 path = "src/bin/bluetooth_test.rs"
+
+[[bin]]
+name = "ds4l_gui"
+path = "src/bin/ds4l_gui/main.rs"
+required-features = ["gui"]

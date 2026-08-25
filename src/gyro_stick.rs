@@ -21,9 +21,76 @@ pub enum GyroMode {
     Hold,
 }
 
+/// Which button gates gyro activation in Toggle/Hold mode. Previously
+/// hardcoded to L2 -- some games' natural aim-down-sights/modifier
+/// button is something else (L1 is common for "aim" in several
+/// shooters), so this needed to be a per-profile choice, not a fixed
+/// constant.
+///
+/// Analog triggers (L2/R2) are gated by GATE_PRESS_THRESHOLD, same
+/// threshold and reasoning as before this became configurable; every
+/// other option here is a plain digital button read straight off
+/// PadState.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GateButton {
+    L1,
+    R1,
+    L2,
+    R2,
+    L3,
+    R3,
+    Cross,
+    Circle,
+    Square,
+    Triangle,
+    Share,
+    Options,
+    Ps,
+    TouchpadClick,
+}
+
+impl Default for GateButton {
+    fn default() -> Self {
+        // L2 -- matches this project's original hardcoded behavior, so
+        // existing profile TOML files saved before this field existed
+        // (and therefore missing `gate_button` under `[gyro]`) keep
+        // behaving exactly as they did before, rather than silently
+        // changing which button controls gyro on upgrade.
+        GateButton::L2
+    }
+}
+
+impl GateButton {
+    fn is_pressed(self, pad: &PadState) -> bool {
+        match self {
+            GateButton::L1 => pad.l1,
+            GateButton::R1 => pad.r1,
+            GateButton::L2 => pad.l2_analog >= GATE_PRESS_THRESHOLD,
+            GateButton::R2 => pad.r2_analog >= GATE_PRESS_THRESHOLD,
+            GateButton::L3 => pad.l3,
+            GateButton::R3 => pad.r3,
+            GateButton::Cross => pad.cross,
+            GateButton::Circle => pad.circle,
+            GateButton::Square => pad.square,
+            GateButton::Triangle => pad.triangle,
+            GateButton::Share => pad.share,
+            GateButton::Options => pad.options,
+            GateButton::Ps => pad.ps,
+            GateButton::TouchpadClick => pad.touchpad_click,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct GyroStickConfig {
     pub mode: GyroMode,
+    /// Which button gates activation in Toggle/Hold mode (ignored for
+    /// AlwaysOn). `#[serde(default)]` so profile files saved before this
+    /// field existed still load, falling back to GateButton::default()
+    /// (L2) -- same backward-compatibility pattern profile.rs already
+    /// uses for Ds4FeedbackConfig/OutputMode.
+    #[serde(default)]
+    pub gate_button: GateButton,
     /// Degrees/sec of gyro rotation that maps to full stick deflection.
     /// Lower = more sensitive (less rotation needed for max stick output).
     /// This is the "moderate, DS4Windows-like default" starting point --
@@ -42,6 +109,7 @@ impl Default for GyroStickConfig {
     fn default() -> Self {
         GyroStickConfig {
             mode: GyroMode::Hold,
+            gate_button: GateButton::default(),
             // Moderate starting point: ~120 deg/s of wrist rotation for
             // full stick deflection is a common comfortable default in
             // DS4Windows-style setups -- fast flicks reach max easily,
@@ -60,14 +128,14 @@ pub struct GyroStickState {
     smoothed_yaw: f64,
     smoothed_pitch: f64,
     toggle_active: bool,
-    /// Tracks previous L2 "pressed" state so toggle mode only flips on the
-    /// rising edge (press), not every report while held.
+    /// Tracks previous gate-button "pressed" state so toggle mode only
+    /// flips on the rising edge (press), not every report while held.
     prev_gate_pressed: bool,
 }
 
-/// Analog trigger value (0-255) above which L2 counts as "held" for
-/// gating purposes. Roughly 50% press, matching DS4Windows' treatment of
-/// analog buttons used as digital gyro toggles.
+/// Analog trigger value (0-255) above which L2/R2 count as "held" when
+/// configured as the gate button -- roughly 50% press, matching
+/// DS4Windows' treatment of analog buttons used as digital gates.
 const GATE_PRESS_THRESHOLD: u8 = 128;
 
 /// Given the current real pad state, calibrated gyro deg/s, and config,
@@ -82,7 +150,7 @@ pub fn compute_gyro_stick_delta(
     gyro_yaw_deg_s: f64,
     gyro_pitch_deg_s: f64,
 ) -> (f64, f64) {
-    let gate_pressed = pad.l2_analog >= GATE_PRESS_THRESHOLD;
+    let gate_pressed = cfg.gate_button.is_pressed(pad);
 
     let active = match cfg.mode {
         GyroMode::AlwaysOn => true,

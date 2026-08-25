@@ -6,6 +6,6 @@ pub mod touchpad;
 pub mod uinput_ds4;
 pub mod uinput_mouse;
 pub mod ds4_bt;
-
-
+pub mod hide_controller;
+pub mod ipc;
 
