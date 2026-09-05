@@ -92,6 +92,7 @@ fn main() {
         GyroMode::AlwaysOn => "ALWAYS-ON (gyro constantly active)",
         GyroMode::Toggle => "TOGGLE (press L2 to flip gyro on/off)",
         GyroMode::Hold => "HOLD (hold L2 to activate gyro)",
+        GyroMode::Disabled => "DISABLED (no gyro-to-stick at all)",
     };
     println!(
         "\nGyro-to-right-stick active, mode: {mode_desc}\n\

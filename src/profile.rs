@@ -12,6 +12,7 @@
 //! later; this module is structured so that's an additive change (call
 //! `load` again with a different name), not a redesign.
 
+use crate::gamepad_remap::GamepadRemapConfig;
 use crate::gyro_stick::GyroStickConfig;
 use crate::kbm::KbmConfig;
 use crate::touchpad::TouchpadConfig;
@@ -20,17 +21,21 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-/// Whole-profile output mode: either drives the virtual DS4 gamepad
-/// (existing behavior since Milestone 3), or drives keyboard/mouse
-/// output instead (kbm.rs) -- DS4Windows's "Controller" vs "Controls"
-/// distinction, confirmed against DS4Windows documentation before
-/// building this. Scoped per-profile rather than per-button, matching
-/// how this was deliberately scoped: create a separate KBM-mode profile
-/// rather than mixing both within one profile.
+/// Whole-profile output mode: drives the virtual DS4 gamepad (existing
+/// behavior since Milestone 3), drives keyboard/mouse output instead
+/// (kbm.rs) -- DS4Windows's "Controller" vs "Controls" distinction,
+/// confirmed against DS4Windows documentation before building this --
+/// or drives a virtual Xbox 360 pad (uinput_x360.rs) for software that
+/// specifically identifies controllers by VID/PID rather than using
+/// generic SDL button prompts (Proton/Wine XInput-only games being the
+/// main case). Scoped per-profile rather than per-button, matching how
+/// this was deliberately scoped: create a separate profile per output
+/// type rather than mixing them within one profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputMode {
     Gamepad,
     Kbm,
+    Xbox360,
 }
 
 impl Default for OutputMode {
@@ -65,6 +70,28 @@ pub struct Ds4FeedbackConfig {
     /// that the daemon connected and picked up the right profile.
     #[serde(default = "default_true")]
     pub rumble_on_load: bool,
+    /// Whether the daemon should flash the lightbar (alternating red /
+    /// off, overriding the configured color) once battery drops to or
+    /// below LOW_BATTERY_THRESHOLD_PERCENT (see ds4l_daemon.rs) while
+    /// not charging. Off by default -- same opt-in reasoning as
+    /// hide_real_controller: a behavior that visibly overrides the
+    /// person's chosen lightbar color should be something they turn on
+    /// deliberately, not a surprise the first time their battery gets
+    /// low. `#[serde(default)]` (false) so profiles saved before this
+    /// field existed keep their exact prior behavior on upgrade.
+    #[serde(default)]
+    pub low_battery_flash: bool,
+    /// Whether the lightbar continuously cycles through the color wheel
+    /// instead of showing the static `lightbar` color -- DS4Windows's
+    /// "Rainbow" option. Off by default, same opt-in reasoning as
+    /// low_battery_flash (visibly overrides the configured color, so it
+    /// should be a deliberate choice). Takes lower priority than
+    /// low_battery_flash: a low-battery warning is safety-relevant
+    /// information and shouldn't be visually competed with by a color
+    /// cycle -- see update_lightbar_effects in ds4l_daemon.rs for the
+    /// precedence logic.
+    #[serde(default)]
+    pub rainbow: bool,
 }
 
 fn default_true() -> bool {
@@ -76,6 +103,8 @@ impl Default for Ds4FeedbackConfig {
         Ds4FeedbackConfig {
             lightbar: LightbarColor::default(),
             rumble_on_load: true,
+            low_battery_flash: false,
+            rainbow: false,
         }
     }
 }
@@ -102,6 +131,13 @@ pub struct Profile {
     pub output_mode: OutputMode,
     #[serde(default)]
     pub kbm: KbmConfig,
+    /// Full button/stick/trigger remapping for Gamepad/Xbox360 output
+    /// modes (see gamepad_remap.rs). `#[serde(default)]` reconstructs
+    /// today's pre-remap 1:1 behavior exactly, so profiles saved before
+    /// this field existed are completely unaffected on upgrade -- see
+    /// GamepadRemapConfig::default()'s own doc comment.
+    #[serde(default)]
+    pub gamepad_remap: GamepadRemapConfig,
     /// Whether the real controller's device nodes should be hidden from
     /// other processes while the daemon runs (see hide_controller.rs).
     /// Defaults to false: hiding is opt-in, not automatic, since it's a
@@ -110,6 +146,20 @@ pub struct Profile {
     /// silently enabled by default.
     #[serde(default)]
     pub hide_real_controller: bool,
+    /// Whether hide_real_controller (if also enabled) should EXCLUDE
+    /// the real controller's kernel-registered Motion Sensors sibling
+    /// device from being hidden, so other software reading gyro/accel
+    /// via that already-correct kernel-exposed evdev device (not our
+    /// own raw-HID reading) keeps working -- see hide_controller.rs's
+    /// module doc for exactly which kernel devices this refers to.
+    /// Independent of `gyro.mode` (gyro-to-stick blending): both can be
+    /// on at once, since one is "let other software read raw gyro" and
+    /// the other is "blend gyro onto our own output stick" -- unrelated
+    /// concerns that happen to share the same physical sensor data.
+    /// Has no effect at all if hide_real_controller is false, since
+    /// nothing is hidden in the first place to exclude anything from.
+    #[serde(default)]
+    pub gyro_passthrough: bool,
 }
 
 impl Default for Profile {
@@ -121,7 +171,9 @@ impl Default for Profile {
             feedback: Ds4FeedbackConfig::default(),
             output_mode: OutputMode::default(),
             kbm: KbmConfig::default(),
+            gamepad_remap: GamepadRemapConfig::default(),
             hide_real_controller: false,
+            gyro_passthrough: false,
         }
     }
 }

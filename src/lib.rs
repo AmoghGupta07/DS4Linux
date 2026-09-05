@@ -5,7 +5,10 @@ pub mod profile;
 pub mod touchpad;
 pub mod uinput_ds4;
 pub mod uinput_mouse;
+pub mod uinput_x360;
+pub mod uinput_absmouse;
 pub mod ds4_bt;
+pub mod gamepad_remap;
 pub mod hide_controller;
 pub mod ipc;
 

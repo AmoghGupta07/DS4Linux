@@ -9,6 +9,25 @@
 //! before permissions change stays valid; Linux doesn't revoke already-
 //! open fds when chmod changes a node's mode bits.
 //!
+//! NATIVE PASSTHROUGH EXCLUSIONS: the DS4's kernel driver (hid-sony /
+//! hid-playstation) doesn't register just one input device for the
+//! whole controller -- it registers up to THREE separate ones, each
+//! with a distinct name: the base gamepad (buttons/sticks), one
+//! suffixed " Touchpad", and one suffixed " Motion Sensors" (gyro/
+//! accel) -- confirmed directly against hid-sony.c kernel source
+//! (`struct input_dev *touchpad; struct input_dev *sensor_dev;`,
+//! `TOUCHPAD_SUFFIX` appended to the base device name) and cross-
+//! checked against real-world Xorg config referencing the exact
+//! product-name strings "...Wireless Controller Touchpad" and
+//! "...Wireless Controller Motion Sensors". This means hiding the
+//! controller doesn't have to be all-or-nothing: `hide()` can leave
+//! specific sibling devices (by name suffix) untouched, so e.g. the
+//! kernel's OWN already-correct touchpad or motion-sensor device stays
+//! usable by other software even while everything else about the
+//! controller is hidden from them -- see ds4l_daemon.rs's use of
+//! `exclude_suffixes` for how TouchpadMode::Passthrough and
+//! gyro_passthrough drive this.
+//!
 //! Scoped as REQUESTED: a runtime-only lock, not a persistent udev rule.
 //! The controller is only hidden while this daemon is alive; permissions
 //! are restored on normal exit AND on SIGINT/SIGTERM/SIGHUP (Ctrl+C,
@@ -38,23 +57,29 @@ pub struct HiddenController {
 
 impl HiddenController {
     /// Finds and locks down every device node belonging to the same
-    /// physical controller as the given hidraw path: the hidraw node
+    /// physical controller as the given hidraw path -- the hidraw node
     /// itself, plus any `js*`/`event*` nodes found under that same HID
     /// device's `input/inputN/` subdirectory in sysfs (these are what
-    /// SDL/joydev-based games read directly, bypassing hidraw entirely
-    /// -- hiding only the hidraw node would leave games using
-    /// joydev/evdev still able to see the real controller).
-    pub fn hide(hidraw_path: &Path) -> Result<Self, String> {
-        let mut nodes = vec![hidraw_path.to_path_buf()];
-        nodes.extend(find_sibling_input_nodes(hidraw_path)?);
-
+    /// SDL/joydev-based games read directly, bypassing hidraw entirely)
+    /// -- EXCEPT any sibling whose registered device name ends with one
+    /// of `exclude_suffixes` (e.g. `" Touchpad"`, `" Motion Sensors"`),
+    /// which is left completely untouched. The hidraw node itself is
+    /// never excluded -- it's the daemon's own low-level read channel
+    /// and hiding it is unrelated to which higher-level sibling devices
+    /// other software should still be able to use.
+    pub fn hide(hidraw_path: &Path, exclude_suffixes: &[&str]) -> Result<Self, String> {
         let mut saved = Vec::new();
-        for node in &nodes {
-            match lock_down(node) {
-                Ok(original_mode) => saved.push(SavedPermissions {
-                    path: node.clone(),
-                    original_mode,
-                }),
+        let mut skipped = Vec::new();
+
+        for node in find_sibling_input_nodes(hidraw_path)? {
+            if let Some(name) = sibling_device_name(&node) {
+                if let Some(matched) = exclude_suffixes.iter().find(|suffix| name.ends_with(**suffix)) {
+                    skipped.push(format!("{} ({name}, matched \"{matched}\")", node.display()));
+                    continue;
+                }
+            }
+            match lock_down(&node) {
+                Ok(original_mode) => saved.push(SavedPermissions { path: node, original_mode }),
                 Err(e) => {
                     // Roll back whatever we already hid before returning
                     // an error, so a partial failure doesn't leave some
@@ -68,15 +93,29 @@ impl HiddenController {
             }
         }
 
+        // Hidraw itself is never excluded -- always locked down last so
+        // a failure here still triggers the same rollback-and-error
+        // path as any sibling failing above.
+        match lock_down(hidraw_path) {
+            Ok(original_mode) => saved.push(SavedPermissions {
+                path: hidraw_path.to_path_buf(),
+                original_mode,
+            }),
+            Err(e) => {
+                let partial = HiddenController { saved };
+                partial.restore();
+                return Err(format!("failed to hide {}: {e}", hidraw_path.display()));
+            }
+        }
+
         println!(
             "Hid {} device node(s) from other processes: {}",
             saved.len(),
-            saved
-                .iter()
-                .map(|s| s.path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            saved.iter().map(|s| s.path.display().to_string()).collect::<Vec<_>>().join(", ")
         );
+        if !skipped.is_empty() {
+            println!("Left visible for native passthrough: {}", skipped.join(", "));
+        }
 
         Ok(HiddenController { saved })
     }
@@ -236,4 +275,19 @@ fn find_sibling_input_nodes(hidraw_path: &Path) -> Result<Vec<PathBuf>, String> 
     }
 
     Ok(found)
+}
+
+/// Reads a `/dev/input/{event,js}N` node's registered device name from
+/// sysfs (`/sys/class/input/<basename>/device/name`) -- e.g. "Sony
+/// Interactive Entertainment Wireless Controller Touchpad" or "...
+/// Motion Sensors" for the DS4's kernel-registered sibling devices (see
+/// module doc). Returns `None` on any error (missing file, permission,
+/// non-UTF8) rather than propagating it -- a name lookup failing just
+/// means that node can't be matched against an exclusion suffix and
+/// will be hidden like any other unmatched sibling, which is the safe
+/// default (fail toward MORE hidden, not less).
+fn sibling_device_name(node_path: &Path) -> Option<String> {
+    let basename = node_path.file_name()?.to_str()?;
+    let name_path = PathBuf::from(format!("/sys/class/input/{basename}/device/name"));
+    std::fs::read_to_string(&name_path).ok().map(|s| s.trim().to_string())
 }

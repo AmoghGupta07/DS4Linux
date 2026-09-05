@@ -21,56 +21,94 @@
 //! line, reply one line, close.
 //!
 //! Commands (client -> server), one per connection:
-//!   PING                    -> "OK PONG"
-//!   STATUS                  -> "OK profile=<name> mode=<Gamepad|Kbm> connection=<USB|Bluetooth> hidden=<true|false>"
-//!   LIST_PROFILES           -> "OK <name1>,<name2>,..." (comma-separated; "OK " with nothing after if none exist)
-//!   SWITCH_PROFILE <name>   -> "OK" on success, "ERR <message>" on failure
+//!   PING                              -> "OK PONG"
+//!   LIST_CONTROLLERS                  -> "OK <id1>,<id2>,..." (comma-separated; "OK" alone if none)
+//!   STATUS <controller_id>            -> "OK profile=<name> mode=<Gamepad|Kbm> connection=<USB|Bluetooth> hidden=<true|false> battery=<0-100> charging=<true|false>"
+//!   LIST_PROFILES                     -> "OK <name1>,<name2>,..." (global, filesystem-based -- not per controller)
+//!   SWITCH_PROFILE <controller_id> <name> -> "OK" on success, "ERR <message>" on failure
 //!
-//! A failed SWITCH_PROFILE always leaves the daemon running its PREVIOUS
-//! profile completely unchanged -- see ds4l_daemon.rs's
+//! PROTOCOL v2: STATUS and SWITCH_PROFILE gained a leading <controller_id>
+//! argument, and LIST_CONTROLLERS is new -- this daemon can now run
+//! several controllers at once (see ds4l_daemon.rs's per-controller
+//! threads), each independently profiled, so every command that used to
+//! implicitly mean "the one controller this daemon drives" now has to
+//! say which one. Breaking the wire format is fine at this stage: this
+//! protocol was only just introduced and (per the note above) hasn't
+//! been relied on by anyone yet.
+//!
+//! For SWITCH_PROFILE, everything after the controller id and ONE space
+//! is taken as the profile name verbatim (so names containing spaces,
+//! e.g. "My Racing Profile", work correctly) -- see parse_command.
+//!
+//! A failed SWITCH_PROFILE always leaves that controller running its
+//! PREVIOUS profile completely unchanged -- see ds4l_daemon.rs's
 //! `apply_profile_switch`, which builds everything the new profile needs
 //! before touching any existing state, so nothing is ever left half
 //! migrated between two profiles.
 //!
 //! Any unrecognized command, or a line that fails to parse, gets
-//! "ERR unknown command" back.
+//! "ERR unknown command" back. STATUS/SWITCH_PROFILE against a
+//! controller id that isn't currently registered gets
+//! "ERR unknown controller \"<id>\"".
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Snapshot of daemon state exposed via STATUS, kept up to date by
-/// main() at startup and after every successful profile switch. Plain
-/// strings rather than re-using ds4l::profile::OutputMode / the
-/// daemon-local Connection enum directly, so this module stays a
-/// self-contained protocol definition that doesn't need to know about
-/// either of those types' representations.
+/// Snapshot of one controller's state exposed via STATUS, kept up to
+/// date by that controller's own thread in ds4l_daemon.rs -- at startup
+/// and after every successful profile switch. Plain strings rather than
+/// re-using ds4l::profile::OutputMode / the daemon-local Connection enum
+/// directly, so this module stays a self-contained protocol definition
+/// that doesn't need to know about either of those types' representations.
 #[derive(Debug, Clone, Default)]
 pub struct StatusSnapshot {
     pub profile_name: String,
     pub output_mode: String, // "Gamepad" or "Kbm"
     pub connection: String,  // "USB" or "Bluetooth"
     pub hidden: bool,
+    /// 0-100, updated continuously (every report, not just on profile
+    /// switch) by the controller's own thread -- unlike the other
+    /// fields here, this changes on its own over time independent of
+    /// anything the person does.
+    pub battery_percent: u8,
+    pub battery_charging: bool,
 }
 
-/// One command relayed from a control-socket connection to the daemon's
-/// main loop, because SWITCH_PROFILE needs to touch live state (virtual
-/// devices, gyro/touchpad/kbm session state, controller-hiding) that
-/// only the main loop's thread should mutate -- the accept-thread that
-/// parses the command runs on a separate OS thread per connection and
-/// must not reach into that state directly. `reply` lets the main loop
-/// report success/failure back to whichever client asked, before that
-/// client's connection closes.
+/// One command relayed from a control-socket connection to a SPECIFIC
+/// controller's thread (looked up in the Registry by controller id
+/// before sending), because SWITCH_PROFILE needs to touch that
+/// controller's live state (virtual devices, gyro/touchpad/kbm session
+/// state, controller-hiding) that only its own thread should mutate.
+/// `reply` lets that thread report success/failure back to whichever
+/// client asked, before that client's connection closes.
 pub enum PendingCommand {
     SwitchProfile {
         name: String,
         reply: Sender<Result<(), String>>,
     },
 }
+
+/// Everything the control socket's accept-thread needs to reach ONE
+/// running controller: a channel into its thread (for SWITCH_PROFILE)
+/// and a shared, continuously-updated status snapshot (for STATUS).
+/// Inserted into the Registry by that controller's thread right after
+/// it starts, and never removed in this pass -- see ds4l_daemon.rs's
+/// doc comment on why hot-unplug isn't handled yet.
+pub struct ControllerHandle {
+    pub cmd_tx: Sender<PendingCommand>,
+    pub status: Arc<Mutex<StatusSnapshot>>,
+}
+
+/// Shared map of controller id -> handle, populated by ds4l_daemon.rs
+/// as each controller's thread starts, read by the control socket's
+/// accept-thread to route STATUS/SWITCH_PROFILE/LIST_CONTROLLERS.
+pub type Registry = Arc<Mutex<HashMap<String, ControllerHandle>>>;
 
 /// Resolves the control socket's path: `$XDG_RUNTIME_DIR/ds4l/control.sock`
 /// when available (the normal case under systemd-managed sessions, where
@@ -92,25 +130,20 @@ pub fn socket_path() -> PathBuf {
     dir.join("control.sock")
 }
 
-/// Starts the control-socket server: binds the socket, spawns a
-/// detached accept-loop thread (one short-lived thread per connection),
-/// and returns a channel the caller's main loop should poll
-/// (non-blockingly, via `try_recv`) for SWITCH_PROFILE requests. PING/
-/// STATUS/LIST_PROFILES are answered entirely within the accept thread
-/// and never reach this channel, since they don't need to touch
-/// main-loop-owned state.
+/// Starts the control socket: binds it and spawns a detached accept-loop
+/// thread (one short-lived thread per connection). All routing happens
+/// through `registry`, which the caller populates as controller threads
+/// start -- this function itself doesn't need to know how many
+/// controllers exist or will exist, only where to look them up.
 ///
 /// Returns an error (rather than panicking) if binding fails, so the
 /// caller can treat "no control socket this run" as a warning, not a
-/// fatal condition -- the daemon is fully usable without it, just not
-/// remotely controllable.
-pub fn start(status: Arc<Mutex<StatusSnapshot>>) -> std::io::Result<Receiver<PendingCommand>> {
+/// fatal condition -- every controller's own thread is still fully
+/// functional without it, just not remotely controllable.
+pub fn start(registry: Registry) -> std::io::Result<()> {
     let path = socket_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
-        // Best-effort tighten to 0700; not fatal if this fails (e.g. the
-        // directory already existed with different ownership from
-        // something else) -- not worth failing daemon startup over.
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
 
@@ -133,7 +166,6 @@ pub fn start(status: Arc<Mutex<StatusSnapshot>>) -> std::io::Result<Receiver<Pen
                 ));
             }
             Err(_) => {
-                // Nobody home -- stale file, safe to remove and rebind.
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -141,28 +173,23 @@ pub fn start(status: Arc<Mutex<StatusSnapshot>>) -> std::io::Result<Receiver<Pen
 
     let listener = UnixListener::bind(&path)?;
 
-    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
             let stream = match incoming {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let tx = tx.clone();
-            let status = status.clone();
-            // One thread per connection: connections are one-shot
-            // (single command, single response, close), so this never
-            // accumulates -- each thread exits as soon as it's replied.
+            let registry = registry.clone();
             std::thread::spawn(move || {
-                handle_connection(stream, &tx, &status);
+                handle_connection(stream, &registry);
             });
         }
     });
 
-    Ok(rx)
+    Ok(())
 }
 
-fn handle_connection(stream: UnixStream, tx: &Sender<PendingCommand>, status: &Arc<Mutex<StatusSnapshot>>) {
+fn handle_connection(stream: UnixStream, registry: &Registry) {
     let mut reader = match stream.try_clone() {
         Ok(s) => BufReader::new(s),
         Err(_) => return,
@@ -177,36 +204,64 @@ fn handle_connection(stream: UnixStream, tx: &Sender<PendingCommand>, status: &A
 
     let response = match parse_command(line) {
         Command::Ping => "OK PONG".to_string(),
-        Command::Status => {
-            let s = status.lock().unwrap();
-            format!(
-                "OK profile={} mode={} connection={} hidden={}",
-                s.profile_name, s.output_mode, s.connection, s.hidden
-            )
+        Command::ListControllers => {
+            let ids: Vec<String> = registry.lock().unwrap().keys().cloned().collect();
+            format!("OK {}", ids.join(","))
+        }
+        Command::Status(id) => {
+            let snapshot = registry
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|handle| handle.status.lock().unwrap().clone());
+            match snapshot {
+                Some(s) => format!(
+                    "OK profile={} mode={} connection={} hidden={} battery={} charging={}",
+                    s.profile_name, s.output_mode, s.connection, s.hidden, s.battery_percent, s.battery_charging
+                ),
+                None => format!("ERR unknown controller \"{id}\""),
+            }
         }
         Command::ListProfiles => match crate::profile::list_profile_names() {
             Ok(names) => format!("OK {}", names.join(",")),
             Err(e) => format!("ERR failed to list profiles: {e}"),
         },
-        Command::SwitchProfile(name) => {
-            let (reply_tx, reply_rx) = mpsc::channel();
-            if tx
-                .send(PendingCommand::SwitchProfile { name, reply: reply_tx })
-                .is_err()
-            {
-                "ERR daemon main loop is not accepting commands (shutting down?)".to_string()
-            } else {
-                // Bounded wait: a switch can take up to ~1s in the worst
-                // case (uinput device recreation + an optional rumble
-                // pulse, see apply_profile_switch's doc comment in
-                // ds4l_daemon.rs), so 5s leaves comfortable headroom
-                // without leaving a client hanging indefinitely if the
-                // main loop is somehow stuck.
-                match reply_rx.recv_timeout(Duration::from_secs(5)) {
-                    Ok(Ok(())) => "OK".to_string(),
-                    Ok(Err(e)) => format!("ERR {e}"),
-                    Err(_) => "ERR timed out waiting for daemon to apply the switch".to_string(),
+        Command::SwitchProfile(id, name) => {
+            // Clone the sender and drop the registry lock BEFORE the
+            // potentially multi-second blocking wait below -- holding
+            // the lock that long would stall every OTHER client's
+            // LIST_CONTROLLERS/STATUS call (they all go through the
+            // same registry mutex) for as long as this one switch takes.
+            let cmd_tx = registry.lock().unwrap().get(&id).map(|h| h.cmd_tx.clone());
+            match cmd_tx {
+                Some(tx) => {
+                    let (reply_tx, reply_rx) = mpsc::channel();
+                    if tx
+                        .send(PendingCommand::SwitchProfile { name, reply: reply_tx })
+                        .is_err()
+                    {
+                        "ERR that controller's thread is not accepting commands (shutting down?)"
+                            .to_string()
+                    } else {
+                        // Bounded wait: a switch can take up to ~1s in
+                        // the worst case (uinput device recreation + an
+                        // optional rumble pulse, see
+                        // apply_profile_switch's doc comment in
+                        // ds4l_daemon.rs), so 5s leaves comfortable
+                        // headroom without leaving a client hanging
+                        // indefinitely if that controller's thread is
+                        // somehow stuck.
+                        match reply_rx.recv_timeout(Duration::from_secs(5)) {
+                            Ok(Ok(())) => "OK".to_string(),
+                            Ok(Err(e)) => format!("ERR {e}"),
+                            Err(_) => {
+                                "ERR timed out waiting for the controller to apply the switch"
+                                    .to_string()
+                            }
+                        }
+                    }
                 }
+                None => format!("ERR unknown controller \"{id}\""),
             }
         }
         Command::Unknown => "ERR unknown command".to_string(),
@@ -217,29 +272,44 @@ fn handle_connection(stream: UnixStream, tx: &Sender<PendingCommand>, status: &A
 
 enum Command {
     Ping,
-    Status,
+    ListControllers,
+    Status(String),
     ListProfiles,
-    SwitchProfile(String),
+    SwitchProfile(String, String),
     Unknown,
 }
 
 fn parse_command(line: &str) -> Command {
     if line == "PING" {
-        Command::Ping
-    } else if line == "STATUS" {
-        Command::Status
-    } else if line == "LIST_PROFILES" {
-        Command::ListProfiles
-    } else if let Some(name) = line.strip_prefix("SWITCH_PROFILE ") {
-        let name = name.trim();
-        if name.is_empty() {
+        return Command::Ping;
+    }
+    if line == "LIST_CONTROLLERS" {
+        return Command::ListControllers;
+    }
+    if line == "LIST_PROFILES" {
+        return Command::ListProfiles;
+    }
+    if let Some(rest) = line.strip_prefix("STATUS ") {
+        let id = rest.trim();
+        return if id.is_empty() {
             Command::Unknown
         } else {
-            Command::SwitchProfile(name.to_string())
-        }
-    } else {
-        Command::Unknown
+            Command::Status(id.to_string())
+        };
     }
+    if let Some(rest) = line.strip_prefix("SWITCH_PROFILE ") {
+        // rest = "<id> <name...>" -- split on the FIRST space only, so a
+        // profile name containing spaces (e.g. "My Racing Profile") is
+        // preserved intact in the second half rather than truncated at
+        // its first word.
+        return match rest.split_once(' ') {
+            Some((id, name)) if !id.trim().is_empty() && !name.trim().is_empty() => {
+                Command::SwitchProfile(id.trim().to_string(), name.trim().to_string())
+            }
+            _ => Command::Unknown,
+        };
+    }
+    Command::Unknown
 }
 
 // ---- Client-side helpers (used by ds4l_gui) ----
@@ -270,17 +340,27 @@ pub fn ping() -> bool {
         .unwrap_or(false)
 }
 
-/// Returns the raw "OK ..." status line, or an error if no daemon is
-/// reachable. Left unparsed (rather than returning a StatusSnapshot)
-/// since the GUI only needs a couple of these fields for display and
-/// re-parsing "key=value" pairs at the call site is simpler than adding
-/// a second serialization format just for this.
-pub fn status() -> std::io::Result<String> {
-    send_command("STATUS")
+pub fn list_controllers() -> std::io::Result<Vec<String>> {
+    let resp = send_command("LIST_CONTROLLERS")?;
+    parse_csv_ok(&resp)
+}
+
+/// Returns the raw "OK ..." status line for one controller, or an error
+/// if no daemon is reachable or that controller id is unknown. Left
+/// unparsed (rather than returning a StatusSnapshot) since callers only
+/// need a couple of these fields for display and re-parsing "key=value"
+/// pairs at the call site is simpler than adding a second serialization
+/// format just for this.
+pub fn status(controller_id: &str) -> std::io::Result<String> {
+    send_command(&format!("STATUS {controller_id}"))
 }
 
 pub fn list_profiles() -> std::io::Result<Vec<String>> {
     let resp = send_command("LIST_PROFILES")?;
+    parse_csv_ok(&resp)
+}
+
+fn parse_csv_ok(resp: &str) -> std::io::Result<Vec<String>> {
     if let Some(rest) = resp.strip_prefix("OK ") {
         Ok(rest
             .split(',')
@@ -291,15 +371,29 @@ pub fn list_profiles() -> std::io::Result<Vec<String>> {
     } else if resp == "OK" {
         Ok(Vec::new())
     } else {
-        Err(std::io::Error::new(std::io::ErrorKind::Other, resp))
+        Err(std::io::Error::new(std::io::ErrorKind::Other, resp.to_string()))
     }
 }
 
-pub fn switch_profile(name: &str) -> std::io::Result<()> {
-    let resp = send_command(&format!("SWITCH_PROFILE {name}"))?;
+pub fn switch_profile(controller_id: &str, name: &str) -> std::io::Result<()> {
+    let resp = send_command(&format!("SWITCH_PROFILE {controller_id} {name}"))?;
     if resp == "OK" {
         Ok(())
     } else {
         Err(std::io::Error::new(std::io::ErrorKind::Other, resp))
     }
+}
+
+/// Extracts one "key=value" field from a raw STATUS response line (e.g.
+/// pulls "72" out of "...battery=72 charging=false..."). Shared by
+/// every GUI surface that displays STATUS output (tray.rs's menu labels
+/// and editor.rs's live controller status line) so the "key=value"
+/// format only has one parser to keep in sync with the format string in
+/// this file's own STATUS handling above, rather than two GUI binaries
+/// each re-implementing the same split-on-whitespace logic.
+pub fn parse_status_field(status_line: &str, key: &str) -> Option<String> {
+    status_line
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix(&format!("{key}=")))
+        .map(str::to_string)
 }

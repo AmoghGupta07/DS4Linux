@@ -97,6 +97,41 @@ pub struct PadState {
     pub accel_x: i16,
     pub accel_y: i16,
     pub accel_z: i16,
+    /// 0-100. Derived from the raw 0-10 (wired) / 0-9 (wireless) level
+    /// byte using the exact formula the Linux kernel's hid-sony.c uses
+    /// (see `parse_report`'s battery-parsing comment) -- not estimated
+    /// or invented.
+    pub battery_percent: u8,
+    pub battery_charging: bool,
+    pub cable_connected: bool,
+}
+
+impl PadState {
+    /// Decomposes the raw dpad nibble (0=N,1=NE,2=E,...,7=NW,8=released,
+    /// per the existing 8-way encoding already relied on elsewhere in
+    /// this project) into four independent up/down/left/right
+    /// booleans, with a diagonal setting both adjacent directions true
+    /// simultaneously -- matching how a physical dpad diagonal press
+    /// naturally reads as "both keys." Shared by every remapping layer
+    /// that treats dpad directions as individually mappable inputs
+    /// (kbm.rs, gamepad_remap.rs) rather than each duplicating this
+    /// match table -- kbm.rs's compute_frame originally had this
+    /// inline; factored out here once a second consumer needed the
+    /// identical logic.
+    pub fn dpad_directions(&self) -> (bool, bool, bool, bool) {
+        // Returns (up, down, left, right).
+        match self.dpad {
+            0 => (true, false, false, false),
+            1 => (true, false, false, true),
+            2 => (false, false, false, true),
+            3 => (false, true, false, true),
+            4 => (false, true, false, false),
+            5 => (false, true, true, false),
+            6 => (false, false, true, false),
+            7 => (true, false, true, false),
+            _ => (false, false, false, false),
+        }
+    }
 }
 
 fn read_i16_le(buf: &[u8], offset: usize) -> i16 {
@@ -256,6 +291,39 @@ pub fn parse_report(buf: &[u8]) -> PadState {
     s.accel_x = read_i16_le(buf, 19);
     s.accel_y = read_i16_le(buf, 21);
     s.accel_z = read_i16_le(buf, 23);
+
+    // Battery level + USB cable state: byte 30 on USB. Lower nibble is
+    // the raw battery level, bit 4 is "USB cable connected." Confirmed
+    // against the Linux kernel patch that introduced this parsing
+    // (hid-sony.c, "HID: sony: Add Dualshock 4 Bluetooth battery and
+    // touchpad parsing", Frank Praznik, 2014) -- byte offset AND the
+    // wired/wireless scaling formula below are copied from that patch's
+    // exact logic, not reverse-engineered independently:
+    //   - Charging is true only when the cable is connected AND the raw
+    //     level is <= 10 (a raw level above 10 while wired means
+    //     "charge complete", not "still charging").
+    //   - Wired levels run 0-10 directly. Wireless (battery-only) levels
+    //     run 0-9 and are incremented by one before scaling, so both
+    //     cases land on the same final 0-10 range before *10 -> percent.
+    // Charging is computed from the RAW level, before the wireless
+    // increment below -- order matters here, matching the kernel's own
+    // evaluation order exactly.
+    if buf.len() > 30 {
+        let raw = buf[30];
+        let cable_connected = (raw >> 4) & 0x01 != 0;
+        let raw_level = raw & 0x0F;
+        let battery_charging = cable_connected && raw_level <= 10;
+        let mut level = raw_level;
+        if !cable_connected {
+            level = level.saturating_add(1);
+        }
+        if level > 10 {
+            level = 10;
+        }
+        s.battery_percent = level * 10;
+        s.battery_charging = battery_charging;
+        s.cable_connected = cable_connected;
+    }
 
     // Touchpad: the kernel patch's "trackpad data starts at offset 33"
     // refers to the START of the touchpad block, which begins with a

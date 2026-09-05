@@ -19,6 +19,14 @@ pub enum GyroMode {
     AlwaysOn,
     Toggle,
     Hold,
+    /// Gyro-to-stick blending never contributes anything, ever --
+    /// distinct from "Hold with a gate you never press," which still
+    /// runs smoothing/gate-tracking every report for no purpose.
+    /// Disabled skips all of that outright. Doesn't affect
+    /// gyro_passthrough (Profile-level, exposes raw gyro to OTHER
+    /// software via the kernel's Motion Sensors device) -- unrelated
+    /// concerns that happen to share the same sensor.
+    Disabled,
 }
 
 /// Which button gates gyro activation in Toggle/Hold mode. Previously
@@ -31,12 +39,29 @@ pub enum GyroMode {
 /// threshold and reasoning as before this became configurable; every
 /// other option here is a plain digital button read straight off
 /// PadState.
+///
+/// L2/R2 vs L2Digital/R2Digital: these are genuinely different signals,
+/// not two names for the same thing. `L2`/`R2` here gate on the ANALOG
+/// trigger value crossing a software threshold (GATE_PRESS_THRESHOLD) --
+/// the original, pre-existing behavior, kept as-is for backward
+/// compatibility (see GateButton::default() below). `L2Digital`/
+/// `R2Digital` instead read the DS4's own hardware trigger-click bit
+/// (`pad.l2_digital`/`pad.r2_digital`, the same signal
+/// gamepad_remap.rs's "L2 (digital click)" row remaps) directly -- a
+/// real, independent bit the controller reports when a trigger is
+/// pressed to its full mechanical end, distinct from "analog value
+/// happens to be past some threshold we picked." Some people may
+/// prefer the crisper, hardware-defined feel of the digital bit over a
+/// tunable software threshold; both are offered rather than one
+/// replacing the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GateButton {
     L1,
     R1,
     L2,
     R2,
+    L2Digital,
+    R2Digital,
     L3,
     R3,
     Cross,
@@ -67,6 +92,8 @@ impl GateButton {
             GateButton::R1 => pad.r1,
             GateButton::L2 => pad.l2_analog >= GATE_PRESS_THRESHOLD,
             GateButton::R2 => pad.r2_analog >= GATE_PRESS_THRESHOLD,
+            GateButton::L2Digital => pad.l2_digital,
+            GateButton::R2Digital => pad.r2_digital,
             GateButton::L3 => pad.l3,
             GateButton::R3 => pad.r3,
             GateButton::Cross => pad.cross,
@@ -150,6 +177,15 @@ pub fn compute_gyro_stick_delta(
     gyro_yaw_deg_s: f64,
     gyro_pitch_deg_s: f64,
 ) -> (f64, f64) {
+    // Disabled skips everything below outright -- no gate tracking, no
+    // smoothing, no computation at all -- rather than running all of
+    // that every report just to discard the result, which is what
+    // "Hold with an unreachable gate" would otherwise cost for the same
+    // observable behavior.
+    if cfg.mode == GyroMode::Disabled {
+        return (0.0, 0.0);
+    }
+
     let gate_pressed = cfg.gate_button.is_pressed(pad);
 
     let active = match cfg.mode {
@@ -163,6 +199,7 @@ pub fn compute_gyro_stick_delta(
             }
             state.toggle_active
         }
+        GyroMode::Disabled => unreachable!("handled by the early return above"),
     };
     state.prev_gate_pressed = gate_pressed;
 

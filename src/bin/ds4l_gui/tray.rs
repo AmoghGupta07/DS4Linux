@@ -1,6 +1,7 @@
-//! System tray icon: shows daemon status, lets the user switch profiles
-//! with one click, and has a menu item to raise the profile editor
-//! window.
+//! System tray icon: shows one submenu per connected controller (each
+//! with its own live status and profile picker), lets the user switch
+//! any controller's profile with one click, and has a menu item to
+//! raise the profile editor window.
 //!
 //! UNVERIFIED -- no way to build/run this in the environment this was
 //! written in (no network access to fetch the `ksni`/`gtk4` crates, and
@@ -27,7 +28,7 @@
 //!      ds4l_daemon before trusting it day-to-day.
 
 use ksni::blocking::TrayMethods;
-use ksni::menu::{RadioGroup, RadioItem, StandardItem};
+use ksni::menu::{RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Icon, MenuItem, Tray};
 use std::sync::mpsc::Sender;
 
@@ -81,47 +82,59 @@ impl Tray for Ds4lTray {
         // call AboutToShow before rendering) -- this is deliberately a
         // live, synchronous round-trip to the daemon's control socket
         // each time, not a cached snapshot, so the checked profile and
-        // status line are never stale by more than "however long the
-        // menu happened to be closed." ipc::status()/list_profiles()
-        // are one-shot blocking calls over a local unix socket, so this
-        // is fast (sub-millisecond typically) -- see ipc.rs.
+        // status per controller are never stale by more than "however
+        // long the menu happened to be closed." ipc calls here are
+        // one-shot blocking round-trips over a local unix socket, so
+        // this is fast (sub-millisecond typically) even with one extra
+        // STATUS call per controller -- see ipc.rs.
+        //
+        // MULTI-CONTROLLER: one submenu per controller id, each with its
+        // own profile radio group -- see ipc.rs's protocol v2 doc
+        // comment for why STATUS/SWITCH_PROFILE now take a controller id
+        // (this daemon can drive more than one DS4 at once, each
+        // independently profiled).
         let mut items: Vec<MenuItem<Self>> = Vec::new();
 
-        match ds4l::ipc::status() {
-            Ok(status_line) => {
-                items.push(
-                    StandardItem {
-                        label: format_status_line(&status_line),
-                        enabled: false,
-                        ..Default::default()
-                    }
-                    .into(),
-                );
+        let controller_ids = match ds4l::ipc::list_controllers() {
+            Ok(ids) if !ids.is_empty() => ids,
+            Ok(_) => {
+                items.push(disabled_item("Daemon running, but no controllers connected"));
+                items.push(MenuItem::Separator);
+                push_footer(&mut items, &self.show_editor_tx);
+                return items;
             }
             Err(_) => {
-                items.push(
-                    StandardItem {
-                        label: "Daemon not running".into(),
-                        enabled: false,
-                        ..Default::default()
-                    }
-                    .into(),
-                );
+                items.push(disabled_item("Daemon not running"));
+                items.push(MenuItem::Separator);
+                push_footer(&mut items, &self.show_editor_tx);
+                return items;
             }
-        }
+        };
 
-        let active_profile = ds4l::ipc::status()
-            .ok()
-            .and_then(|s| parse_field(&s, "profile"));
+        // Profile list is global (filesystem-based), so it's the same
+        // set of choices offered under every controller's submenu --
+        // only WHICH one is currently selected differs per controller.
+        let profile_names = ds4l::ipc::list_profiles().unwrap_or_default();
 
-        match ds4l::ipc::list_profiles() {
-            Ok(names) if !names.is_empty() => {
+        for controller_id in controller_ids {
+            let status_line = ds4l::ipc::status(&controller_id).ok();
+            let active_profile = status_line.as_deref().and_then(|s| ds4l::ipc::parse_status_field(s, "profile"));
+
+            let submenu_label = match &status_line {
+                Some(s) => format!("{controller_id} \u{2014} {}", format_status_line(s)),
+                None => format!("{controller_id} \u{2014} (unreachable)"),
+            };
+
+            let mut submenu_items: Vec<MenuItem<Self>> = Vec::new();
+            if profile_names.is_empty() {
+                submenu_items.push(disabled_item("No profiles found"));
+            } else {
                 let selected = active_profile
                     .as_ref()
-                    .and_then(|active| names.iter().position(|n| n == active))
+                    .and_then(|active| profile_names.iter().position(|n| n == active))
                     .unwrap_or(usize::MAX);
 
-                let options: Vec<RadioItem> = names
+                let options: Vec<RadioItem> = profile_names
                     .iter()
                     .map(|name| RadioItem {
                         label: name.clone(),
@@ -129,14 +142,18 @@ impl Tray for Ds4lTray {
                     })
                     .collect();
 
-                items.push(
+                let names_for_closure = profile_names.clone();
+                let id_for_closure = controller_id.clone();
+                submenu_items.push(
                     RadioGroup {
                         selected,
                         options,
                         select: Box::new(move |_this: &mut Self, index: usize| {
-                            if let Some(name) = names.get(index) {
-                                if let Err(e) = ds4l::ipc::switch_profile(name) {
-                                    eprintln!("Failed to switch profile from tray: {e}");
+                            if let Some(name) = names_for_closure.get(index) {
+                                if let Err(e) = ds4l::ipc::switch_profile(&id_for_closure, name) {
+                                    eprintln!(
+                                        "Failed to switch profile for {id_for_closure} from tray: {e}"
+                                    );
                                 }
                             }
                         }),
@@ -144,92 +161,91 @@ impl Tray for Ds4lTray {
                     .into(),
                 );
             }
-            Ok(_) => {
-                items.push(
-                    StandardItem {
-                        label: "No profiles found".into(),
-                        enabled: false,
-                        ..Default::default()
-                    }
-                    .into(),
-                );
-            }
-            Err(_) => {
-                // Listing profiles reads the filesystem directly (see
-                // ipc::list_profiles -> profile::list_profile_names),
-                // independent of whether the daemon is running, so this
-                // branch means something more fundamental is wrong
-                // (e.g. can't read ~/.config/ds4l/profiles/) rather than
-                // "daemon not running", which is already reported above.
-                items.push(
-                    StandardItem {
-                        label: "Could not read profiles directory".into(),
-                        enabled: false,
-                        ..Default::default()
-                    }
-                    .into(),
-                );
-            }
+
+            items.push(
+                SubMenu {
+                    label: submenu_label,
+                    submenu: submenu_items,
+                    ..Default::default()
+                }
+                .into(),
+            );
         }
 
-        items.push(ksni::menu::MenuItem::Separator);
-
-        let tx = self.show_editor_tx.clone();
-        items.push(
-            StandardItem {
-                label: "Edit Profiles...".into(),
-                activate: Box::new(move |_this: &mut Self| {
-                    let _ = tx.send(TrayEvent::ShowEditor);
-                }),
-                ..Default::default()
-            }
-            .into(),
-        );
-
-        items.push(
-            StandardItem {
-                label: "Quit".into(),
-                activate: Box::new(|_this: &mut Self| {
-                    // Quits the GUI (tray + editor) only -- deliberately
-                    // does NOT stop ds4l_daemon, which is a separate
-                    // process the tray merely talks to over the control
-                    // socket. Stopping the actual gamepad daemon from a
-                    // "Quit" click on a status-icon menu would be a
-                    // surprising, easy-to-trigger-by-accident action;
-                    // `systemctl stop ds4l` (once systemd packaging
-                    // exists) or Ctrl+C on the daemon's own terminal are
-                    // the deliberate ways to do that.
-                    std::process::exit(0);
-                }),
-                ..Default::default()
-            }
-            .into(),
-        );
-
+        items.push(MenuItem::Separator);
+        push_footer(&mut items, &self.show_editor_tx);
         items
     }
 }
 
-/// Turns the raw "OK profile=X mode=Y connection=Z hidden=W" status
-/// line into a short, human-readable menu label. Falls back to showing
-/// the raw line if the format ever doesn't match what's expected,
-/// rather than hiding information the person might want to see when
-/// debugging.
-fn format_status_line(raw: &str) -> String {
-    let profile = parse_field(raw, "profile");
-    let mode = parse_field(raw, "mode");
-    let connection = parse_field(raw, "connection");
-    match (profile, mode, connection) {
-        (Some(p), Some(m), Some(c)) => format!("{p} ({m}, {c})"),
-        _ => raw.to_string(),
+fn disabled_item<T: Tray>(label: &str) -> MenuItem<T> {
+    StandardItem {
+        label: label.to_string(),
+        enabled: false,
+        ..Default::default()
     }
+    .into()
 }
 
-fn parse_field(status_line: &str, key: &str) -> Option<String> {
-    status_line
-        .split_whitespace()
-        .find_map(|token| token.strip_prefix(&format!("{key}=")))
-        .map(str::to_string)
+/// Appends the "Edit Profiles..." and "Quit" items shared by every menu
+/// state (normal, daemon-unreachable, no-controllers) -- factored out
+/// so those early-return branches above don't have to duplicate them.
+fn push_footer(items: &mut Vec<MenuItem<Ds4lTray>>, show_editor_tx: &Sender<TrayEvent>) {
+    let tx = show_editor_tx.clone();
+    items.push(
+        StandardItem {
+            label: "Edit Profiles...".into(),
+            activate: Box::new(move |_this: &mut Ds4lTray| {
+                let _ = tx.send(TrayEvent::ShowEditor);
+            }),
+            ..Default::default()
+        }
+        .into(),
+    );
+
+    items.push(
+        StandardItem {
+            label: "Quit".into(),
+            activate: Box::new(|_this: &mut Ds4lTray| {
+                // Quits the GUI (tray + editor) only -- deliberately
+                // does NOT stop ds4l_daemon, which is a separate
+                // process the tray merely talks to over the control
+                // socket. Stopping the actual gamepad daemon from a
+                // "Quit" click on a status-icon menu would be a
+                // surprising, easy-to-trigger-by-accident action;
+                // `systemctl stop ds4l` (once systemd packaging
+                // exists) or Ctrl+C on the daemon's own terminal are
+                // the deliberate ways to do that.
+                std::process::exit(0);
+            }),
+            ..Default::default()
+        }
+        .into(),
+    );
+}
+
+/// Turns the raw "OK profile=X mode=Y connection=Z hidden=W" status
+/// line into a short, human-readable menu label. Falls back to showing
+/// Turns the raw "OK profile=X mode=Y connection=Z hidden=W battery=N
+/// charging=B" status line into a short, human-readable menu label.
+/// Falls back to showing the raw line if the format ever doesn't match
+/// what's expected, rather than hiding information the person might
+/// want to see when debugging.
+fn format_status_line(raw: &str) -> String {
+    let profile = ds4l::ipc::parse_status_field(raw, "profile");
+    let mode = ds4l::ipc::parse_status_field(raw, "mode");
+    let connection = ds4l::ipc::parse_status_field(raw, "connection");
+    let battery = ds4l::ipc::parse_status_field(raw, "battery");
+    let charging = ds4l::ipc::parse_status_field(raw, "charging").as_deref() == Some("true");
+
+    match (profile, mode, connection) {
+        (Some(p), Some(m), Some(c)) => match battery {
+            Some(pct) if charging => format!("{p} ({m}, {c}, {pct}% \u{26a1}charging)"),
+            Some(pct) => format!("{p} ({m}, {c}, {pct}%)"),
+            None => format!("{p} ({m}, {c})"),
+        },
+        _ => raw.to_string(),
+    }
 }
 
 /// Starts the tray icon on a background thread/task managed internally

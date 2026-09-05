@@ -23,6 +23,13 @@
 // 5. Does touchpad finger position track correctly? This is explicitly
 //    flagged as the LEAST certain part of the BT parser -- expect this
 //    to need a fix.
+// 6. NEW: does batt:% look sane (moves slowly, doesn't jump around) and
+//    does cable: correctly reflect whether USB is actually plugged in
+//    (while still connected over BT)? Derived from kernel source
+//    (buf[32], see ds4_bt.rs's parse_report_bt) and cross-checked
+//    against this file's own already-verified touchpad offset, but not
+//    yet confirmed against a live hidraw capture the way the offsets
+//    above were.
 
 use ds4l::ds4_bt::{read_calibration_bt, trigger_full_report_mode};
 use ds4l::ds4_input::{calibrated_gyro_deg_s, SONY_VID};
@@ -155,6 +162,7 @@ fn main() {
                 print!(
                     "\rLX:{:3} LY:{:3} RX:{:3} RY:{:3} dpad:{} △:{} ○:{} ×:{} □:{} \
                      gyro(deg/s) p:{:6.1} y:{:6.1} r:{:6.1} touch1(active:{} x:{} y:{}) \
+                     batt:{:3}% chg:{} cable:{} \
                      crc_ok:{}/{}          ",
                     state.lx,
                     state.ly,
@@ -171,11 +179,25 @@ fn main() {
                     state.finger1.touching as u8,
                     state.finger1.x,
                     state.finger1.y,
+                    state.battery_percent,
+                    state.battery_charging as u8,
+                    state.cable_connected as u8,
                     total_reads - crc_failures,
                     total_reads,
                 );
                 use std::io::Write;
                 std::io::stdout().flush().ok();
+                // CHECK (new): does batt:% look like a sane battery
+                // reading, moving down slowly over real time and NOT
+                // jumping around erratically report-to-report? Does
+                // cable: flip to 1 only when actually plugged in via
+                // USB while still connected over BT (if you can test
+                // that combination), and chg: go to 1 only while cable
+                // is 1 and the battery hasn't hit "charge complete"? If
+                // any of these look wrong, the buf[32] offset this
+                // reads from (see ds4_bt.rs's parse_report_bt) needs a
+                // second look -- it was derived from kernel source, not
+                // confirmed against your specific hardware yet.
             }
             Err(e) => {
                 eprintln!("\nread error: {e}");

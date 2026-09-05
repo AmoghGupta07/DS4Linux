@@ -152,8 +152,6 @@ pub fn parse_report_bt(buf: &[u8]) -> PadState {
 
     // buf[12-13]: timestamp -- not currently used, kept for future
     // reference (would matter for precise gyro integration timing).
-    // buf[14]: battery -- not currently exposed to PadState; a natural
-    // follow-up once this milestone is confirmed working.
 
     s.gyro_x = read_i16_le(buf, 15);
     s.gyro_y = read_i16_le(buf, 17);
@@ -162,6 +160,42 @@ pub fn parse_report_bt(buf: &[u8]) -> PadState {
     s.accel_x = read_i16_le(buf, 21);
     s.accel_y = read_i16_le(buf, 23);
     s.accel_z = read_i16_le(buf, 25);
+
+    // Battery level + USB cable state, at buf[32] -- same parsing as
+    // ds4_input.rs's USB version (see that function's comment for the
+    // full formula and kernel citation), just at the BT offset instead
+    // of USB's 30.
+    //
+    // CORRECTION: an earlier version of this file left a comment here
+    // claiming battery lived at buf[14], never actually implemented.
+    // That offset was wrong. Cross-checked two independent ways against
+    // the SAME kernel patch this project already used to confirm the
+    // USB offset (hid-sony.c, "HID: sony: Add Dualshock 4 Bluetooth
+    // battery and touchpad parsing"): (1) the patch sets the BT battery
+    // offset to 32 directly; (2) the patch then does `offset += 5` and
+    // states the result "starts at offset 35 on USB and 37 on
+    // Bluetooth" for touchpad data -- 32 + 5 = 37, which matches this
+    // file's OWN already-hardware-verified `buf[37..41]` finger1 parsing
+    // below exactly. Both independent derivations land on 32, not 14 --
+    // buf[14] would have put "battery" inside what's actually gyro data
+    // (buf[15] onward) territory, which is a strong sign it was never
+    // cross-checked before being written down.
+    if buf.len() > 32 {
+        let raw = buf[32];
+        let cable_connected = (raw >> 4) & 0x01 != 0;
+        let raw_level = raw & 0x0F;
+        let battery_charging = cable_connected && raw_level <= 10;
+        let mut level = raw_level;
+        if !cable_connected {
+            level = level.saturating_add(1);
+        }
+        if level > 10 {
+            level = 10;
+        }
+        s.battery_percent = level * 10;
+        s.battery_charging = battery_charging;
+        s.cable_connected = cable_connected;
+    }
 
     // Touchpad: first touch-report block starts after the "number of
     // trackpad packets" (buf[35]) and first packet counter (buf[36]).

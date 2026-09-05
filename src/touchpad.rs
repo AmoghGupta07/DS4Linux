@@ -1,11 +1,36 @@
 //! Touchpad mode selection and mouse-remap math.
 //!
-//! Two modes, matching what was scoped: Passthrough sends real touchpad
-//! coordinates straight to the virtual DS4's multitouch axes (for games
-//! that read touchpad-as-touchpad); MouseRemap converts finger movement
-//! deltas into relative mouse motion on a separate virtual mouse device.
-//! Selected per config for now (stand-in for the future per-profile
-//! setting), matching the same pattern as gyro_stick's GyroMode.
+//! Three modes: MouseRemap converts finger movement deltas into relative
+//! mouse motion on a separate virtual mouse device; AbsoluteMouse maps
+//! the touchpad surface directly onto the screen like a graphics
+//! tablet/touchscreen -- touch a spot, the cursor jumps there
+//! proportionally, rather than dragging from wherever it already was;
+//! Passthrough does nothing at all on this project's end.
+//!
+//! REDESIGNED Passthrough: an earlier version re-emitted real touchpad
+//! coordinates onto the virtual DS4's own multitouch axes -- our own
+//! from-scratch reimplementation of something the Linux kernel's DS4
+//! driver (hid-sony/hid-playstation) already does correctly on its own,
+//! as a fully separate, already-registered evdev device (confirmed
+//! against hid-sony.c kernel source -- see hide_controller.rs's module
+//! doc). Re-emitting was redundant at best (when hide_real_controller
+//! is off, which is the default, the kernel's own touchpad device is
+//! ALREADY fully visible to everything, independent of anything this
+//! project does) and duplicated effort on the single least-verified
+//! parsing path in this whole project (see ds4_bt.rs's touchpad offset
+//! history) for zero benefit over just leaving the kernel's own device
+//! alone. Passthrough now means exactly that: emit nothing touchpad-
+//! related on our own virtual device, and -- if hide_real_controller is
+//! also on -- specifically exclude the kernel's Touchpad sibling device
+//! from being hidden, so it stays usable (see hide_controller.rs's
+//! `exclude_suffixes` and ds4l_daemon.rs's use of it). MouseRemap and
+//! AbsoluteMouse still hide that sibling device when hide_real_controller
+//! is on, deliberately: leaving it visible during those modes would let
+//! the desktop's own libinput touchpad-as-cursor recognition fight with
+//! this project's own synthetic pointer for control of the same cursor.
+//!
+//! Selected per config (stand-in for the future per-profile setting,
+//! matching the same pattern as gyro_stick's GyroMode).
 //!
 //! MouseRemap's 2-finger behavior follows DS4Windows's confirmed
 //! convention: 1 finger drags the cursor, 2 fingers scroll instead
@@ -13,6 +38,14 @@
 //! of left-click. This was verified against DS4Windows documentation/
 //! guides before implementing, rather than assumed, since building the
 //! wrong gesture mapping would mean redoing this later.
+//!
+//! AbsoluteMouse reuses the SAME 1-finger-left/2-finger-right click
+//! convention as MouseRemap for consistency within this project, NOT
+//! because it's independently confirmed against DS4Windows's own
+//! absolute-mode click behavior specifically (unlike MouseRemap's
+//! convention above, which was checked against DS4Windows docs before
+//! building) -- worth testing by feel and adjusting if it doesn't match
+//! expectations.
 
 use crate::ds4_input::TouchFinger;
 use serde::{Deserialize, Serialize};
@@ -21,6 +54,18 @@ use serde::{Deserialize, Serialize};
 pub enum TouchpadMode {
     Passthrough,
     MouseRemap,
+    AbsoluteMouse,
+    /// Fully suppressed: no processing on our end (same as Passthrough
+    /// in that regard), but UNLIKE Passthrough, does NOT exclude the
+    /// kernel's Touchpad sibling device from hiding -- if
+    /// hide_real_controller is also on, the touchpad is hidden along
+    /// with everything else, genuinely unusable by anything. If
+    /// hide_real_controller is off, this has the same practical effect
+    /// as Passthrough (the kernel's device was always independently
+    /// visible either way) -- Disabled only diverges from Passthrough
+    /// when hiding is actually in play. Worth being upfront about: this
+    /// isn't a stronger guarantee than that.
+    Disabled,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -151,5 +196,32 @@ pub fn click_button_for_finger_count(finger_count: u8) -> Option<ClickButton> {
         1 => Some(ClickButton::Left),
         2 => Some(ClickButton::Right),
         _ => None,
+    }
+}
+
+/// What AbsoluteMouse mode wants to happen this frame -- much simpler
+/// than MouseAction since absolute positioning needs no delta tracking
+/// or state at all: the touchpad already reports absolute coordinates,
+/// and the virtual pointer device (uinput_absmouse.rs) is set up with
+/// its own ABS_X/ABS_Y range matching the touchpad's native resolution
+/// exactly, so a touched position can be forwarded as-is with no
+/// rescaling. `None` when no finger is touching -- the cursor simply
+/// stays wherever it last was, same as lifting a stylus off a tablet.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AbsoluteMouseAction {
+    None,
+    Move { x: i32, y: i32 },
+}
+
+/// Reads finger1's raw position directly -- no persistent state needed,
+/// unlike compute_mouse_action, since there's no delta to track.
+pub fn compute_absolute_mouse_action(finger1: &TouchFinger) -> AbsoluteMouseAction {
+    if finger1.touching {
+        AbsoluteMouseAction::Move {
+            x: finger1.x as i32,
+            y: finger1.y as i32,
+        }
+    } else {
+        AbsoluteMouseAction::None
     }
 }

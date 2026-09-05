@@ -1,5 +1,5 @@
-// Milestone 4 (+2-finger extension): touchpad support, both modes, up to
-// 2 simultaneous fingers.
+// Milestone 4 (+2-finger extension, +AbsoluteMouse): touchpad support,
+// all three modes, up to 2 simultaneous fingers.
 //
 // - Passthrough mode: real finger positions -> virtual DS4's multitouch
 //   axes (both slots), for games that read the DS4 touchpad natively.
@@ -7,6 +7,14 @@
 //   (vertical) and switch click-to-right-click -- confirmed DS4Windows
 //   convention ("Two Finger Slide" = Scroll, 2-finger press = right
 //   click), not an invented behavior.
+// - AbsoluteMouse mode: touchpad position maps directly onto the screen
+//   like a graphics tablet/touchscreen (uinput_absmouse.rs's
+//   INPUT_PROP_DIRECT virtual device) -- NEW, not yet verified against
+//   a live display server the same way MouseRemap/Passthrough were
+//   confirmed here. This tool is the right place to check it: run with
+//   TOUCHPAD_MODE = TouchpadMode::AbsoluteMouse, then confirm touching
+//   different corners of the DS4 touchpad moves the cursor to the
+//   corresponding corner of the actual screen.
 //
 // Everything from Milestone 3.5 (gyro-to-right-stick, passthrough for
 // sticks/buttons/dpad/triggers) is unchanged and still active.
@@ -17,13 +25,14 @@
 use ds4l::ds4_input::{calibrated_gyro_deg_s, open_and_calibrate, parse_report, PadState};
 use ds4l::gyro_stick::{self, GyroMode, GyroStickConfig, GyroStickState};
 use ds4l::touchpad::{self, ClickButton, MouseAction, TouchpadConfig, TouchpadMode, TouchpadMouseState};
+use ds4l::uinput_absmouse::{self, VirtualAbsMouse};
 use ds4l::uinput_ds4::{self, VirtualDs4};
 use ds4l::uinput_mouse::{self, VirtualMouse};
 use hidapi::HidApi;
 use std::time::Duration;
 
-/// Edit this to switch modes: TouchpadMode::Passthrough or
-/// TouchpadMode::MouseRemap.
+/// Edit this to switch modes: TouchpadMode::Passthrough,
+/// TouchpadMode::MouseRemap, or TouchpadMode::AbsoluteMouse.
 const TOUCHPAD_MODE: TouchpadMode = TouchpadMode::MouseRemap;
 
 const GYRO_MODE: GyroMode = GyroMode::Hold;
@@ -114,6 +123,19 @@ fn main() {
     } else {
         None
     };
+
+    // Same reasoning for the absolute pointer device: only created when
+    // actually testing AbsoluteMouse mode.
+    let mut virtual_absmouse = if TOUCHPAD_MODE == TouchpadMode::AbsoluteMouse {
+        Some(VirtualAbsMouse::create().unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to create virtual absolute pointer: {e}\nCheck /dev/uinput permissions."
+            );
+            std::process::exit(1);
+        }))
+    } else {
+        None
+    };
     println!("Virtual device(s) created.");
 
     let gyro_cfg = GyroStickConfig {
@@ -131,6 +153,10 @@ fn main() {
     let mode_desc = match TOUCHPAD_MODE {
         TouchpadMode::Passthrough => "PASSTHROUGH (native touchpad data to virtual DS4)",
         TouchpadMode::MouseRemap => "MOUSE-REMAP (finger movement -> virtual mouse)",
+        TouchpadMode::AbsoluteMouse => {
+            "ABSOLUTE-MOUSE (touchpad position -> screen position directly, tablet-style)"
+        }
+        TouchpadMode::Disabled => "DISABLED (no touchpad processing at all)",
     };
     println!(
         "\nTouchpad mode: {mode_desc}\n\
@@ -210,6 +236,49 @@ fn main() {
                             .and_then(|_| mouse.sync());
                         if let Err(e) = click_result {
                             eprintln!("\nfailed to emit mouse click: {e}");
+                        }
+                    }
+                }
+
+                if touchpad_cfg.mode == TouchpadMode::AbsoluteMouse {
+                    if let Some(abs) = virtual_absmouse.as_mut() {
+                        if let touchpad::AbsoluteMouseAction::Move { x, y } =
+                            touchpad::compute_absolute_mouse_action(&state.finger1)
+                        {
+                            let move_result = abs
+                                .emit_abs(uinput_absmouse::ABS_X, x)
+                                .and_then(|_| abs.emit_abs(uinput_absmouse::ABS_Y, y))
+                                .and_then(|_| abs.sync());
+                            if let Err(e) = move_result {
+                                eprintln!("\nfailed to emit absolute pointer position: {e}");
+                            }
+                        }
+
+                        // Same 1-finger-left/2-finger-right convention
+                        // as MouseRemap, for consistency -- see
+                        // touchpad.rs's module doc comment on why this
+                        // is our own choice, not an independently
+                        // confirmed DS4Windows behavior for this
+                        // specific mode.
+                        let finger_count =
+                            state.finger1.touching as u8 + state.finger2.touching as u8;
+                        let click_target = touchpad::click_button_for_finger_count(finger_count);
+
+                        let click_result = abs
+                            .emit_key(
+                                uinput_absmouse::BTN_LEFT,
+                                state.touchpad_click && click_target == Some(ClickButton::Left),
+                            )
+                            .and_then(|_| {
+                                abs.emit_key(
+                                    uinput_absmouse::BTN_RIGHT,
+                                    state.touchpad_click
+                                        && click_target == Some(ClickButton::Right),
+                                )
+                            })
+                            .and_then(|_| abs.sync());
+                        if let Err(e) = click_result {
+                            eprintln!("\nfailed to emit absolute pointer click: {e}");
                         }
                     }
                 }
